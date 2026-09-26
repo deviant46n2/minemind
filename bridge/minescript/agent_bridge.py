@@ -53,8 +53,14 @@ def op_state(_req):
         except Exception:
             pass
     pos = _fn("player_position")
+    p = None
     if pos:
-        x, y, z = pos()
+        try:
+            p = pos()
+        except Exception:
+            p = None
+    if p:
+        x, y, z = p
         out["position"] = {"x": round(x, 1), "y": round(y, 1), "z": round(z, 1)}
     health = _fn("player_health")
     if health:
@@ -220,12 +226,71 @@ def op_screenshot(_req):
     return True
 
 
+def op_close_screen(_req):
+    """Close whatever GUI screen is open (Game Menu etc.) via Minecraft.setScreen(null).
+
+    In-process Java interop — no OS key/click, so it never steals focus from
+    the human's game window. show_chat_screen can't do this (it only closes
+    ChatScreen), and Escape via xdotool lands on whichever window has focus.
+
+    Two traps this avoids:
+
+    * Screen.onClose() (m_7379_) is the wrong action — PauseScreen does not
+      override it, so it runs Screen.onClose() -> Minecraft.popGuiLayer() and
+      the menu stays up. Vanilla's "Back to Game" button calls
+      Minecraft.setScreen(null) (SRG m_91152_), so that is the op.
+
+    * Minecraft.f_91080_ (the screen field) must NOT be read: minescript's
+      java_access_field hands back a truthy null-ish handle for object
+      fields. Feeding that into Method.invoke produced the live
+      NullPointerException, and trusting it made the op report "still open"
+      while the screen was gone. screen_name() is the observable op_state
+      already reports as open_screen, so the two can't disagree.
+    """
+    cls_fn, member_fn = _fn("java_class"), _fn("java_member")
+    call_fn = _fn("java_call_method")
+    screen_name = _fn("screen_name")
+    if not all((cls_fn, member_fn, call_fn, screen_name)):
+        return None
+    # minescript's java_null is handle 0, so `is None` never matches a null
+    # handle: a null target reaches Method.invoke and dies as
+    # NullPointerException "Cannot invoke Object.getClass() because obj is null".
+    null = _fn("java_null")
+    if null is None:
+        null = 0
+    try:
+        open_screen = screen_name()
+    except Exception as exc:
+        return {"closed": False, "reason": f"screen_name: {type(exc).__name__}: {exc}"}
+    if not open_screen:
+        return {"closed": False, "reason": "no screen"}
+    label = "class Minecraft"
+    try:
+        cls = cls_fn("net.minecraft.client.Minecraft")
+        label = "member m_91087_"
+        get_instance = member_fn(cls, "m_91087_")
+        label = "getInstance"
+        mc = call_fn(cls, get_instance)
+        label = "member m_91152_"
+        set_screen = member_fn(cls, "m_91152_")
+        label = "setScreen(null)"
+        call_fn(mc, set_screen, null)
+        label = "screen_name re-check"
+        still_open = screen_name()
+    except Exception as exc:
+        return {"closed": False, "reason": f"{label}: {type(exc).__name__}: {exc}"}
+    if still_open:
+        return {"closed": False, "reason": f"still open after setScreen(null): {still_open}"}
+    return {"closed": True}
+
+
 OPS = {"probe": op_probe, "state": op_state, "chat": op_chat, "echo": op_echo,
        "chat_log": op_chat_log, "getblock": op_getblock, "container": op_container,
        "look_at": op_look_at, "press": op_press, "inventory_slots": op_inventory_slots,
        "select_slot": op_select_slot, "slot_to_hotbar": op_slot_to_hotbar,
        "hand": op_hand, "entities": op_entities, "targeted_block": op_targeted_block,
-       "container_click": op_container_click, "screenshot": op_screenshot}
+       "container_click": op_container_click, "screenshot": op_screenshot,
+       "close_screen": op_close_screen}
 
 
 def chat_listener():
@@ -251,41 +316,53 @@ def chat_listener():
 
 def main():
     threading.Thread(target=chat_listener, daemon=True).start()
-    minescript.echo(f"[bridge] connecting to daemon at {HOST}:{PORT} ...")
-    try:
-        sock = socket.create_connection((HOST, PORT), timeout=10)
+    attempt = 0
+    while True:  # reconnect forever: daemon restarts must not kill the bridge
+        sock = None
+        while sock is None:
+            try:
+                sock = socket.create_connection((HOST, PORT), timeout=10)
+                attempt = 0
+            except OSError as exc:
+                attempt += 1
+                if attempt == 1:
+                    minescript.echo(f"[bridge] waiting for daemon at {HOST}:{PORT} ({exc}) ...")
+                time.sleep(3)
         # connect timeout must NOT persist: the daemon can be silent for minutes
         # while the LLM plans — a lingering timeout kills recv() (live-run crash)
         sock.settimeout(None)
-    except OSError as exc:
-        minescript.echo(f"[bridge] FAILED to connect ({exc}) — start the daemon first:")
-        minescript.echo("[bridge]   python D:/reclamation-agent/agent/daemon.py")
-        return
-    minescript.echo("[bridge] connected — agent has control. \\killjob to stop.")
-    buf = b""
-    try:
-        while True:
-            chunk = sock.recv(65536)
-            if not chunk:
-                break
-            buf += chunk
-            while b"\n" in buf:
-                line, buf = buf.split(b"\n", 1)
-                if not line.strip():
-                    continue
-                req = json.loads(line)
-                if req.get("op") == "stop":
-                    sock.sendall(json.dumps({"id": req.get("id"), "ok": True, "result": "bye"}).encode() + b"\n")
-                    return
-                try:
-                    result = OPS[req["op"]](req)
-                    resp = {"id": req.get("id"), "ok": True, "result": result}
-                except Exception as exc:
-                    resp = {"id": req.get("id"), "ok": False, "error": f"{type(exc).__name__}: {exc}"}
-                sock.sendall(json.dumps(resp).encode() + b"\n")
-    finally:
-        sock.close()
-        minescript.echo("[bridge] disconnected.")
+        minescript.echo("[bridge] connected — agent has control. \\killjob to stop.")
+        buf = b""
+        try:
+            while True:
+                chunk = sock.recv(65536)
+                if not chunk:
+                    break
+                buf += chunk
+                while b"\n" in buf:
+                    line, buf = buf.split(b"\n", 1)
+                    if not line.strip():
+                        continue
+                    req = json.loads(line)
+                    if req.get("op") == "stop":
+                        sock.sendall(json.dumps({"id": req.get("id"), "ok": True, "result": "bye"}).encode() + b"\n")
+                        return
+                    try:
+                        result = OPS[req["op"]](req)
+                        resp = {"id": req.get("id"), "ok": True, "result": result}
+                    except Exception as exc:
+                        resp = {"id": req.get("id"), "ok": False, "error": f"{type(exc).__name__}: {exc}"}
+                    sock.sendall(json.dumps(resp).encode() + b"\n")
+        except OSError:
+            # daemon died with unread data -> RST, not EOF. Same story as the
+            # b"" above: connection is gone, fall through to the retry loop
+            # instead of letting the exception kill this job.
+            pass
+        finally:
+            sock.close()
+            minescript.echo("[bridge] disconnected — retrying in 3s.")
+        time.sleep(3)
 
 
-main()
+if __name__ == "__main__":
+    main()

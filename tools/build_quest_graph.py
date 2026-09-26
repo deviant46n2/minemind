@@ -1,12 +1,20 @@
-"""Build quest_graph.json from the Reclamation pack's FTB Quests SNBT files.
+"""Build quest_graph.json from a pack's FTB Quests SNBT files.
 
 Reads chapters/*.snbt + the ftbquestlocalizer lang file, resolves titles and
 descriptions, flattens tasks/rewards/dependencies, and emits a single JSON
 DAG the planner can consume. Also runs sanity checks (dangling deps, cycles).
 
-Usage: python tools/build_quest_graph.py
+Source resolution:
+  AGENT_MC_DIR=<instance>/minecraft   (e.g. .../instances/<pack>/minecraft)
+      -> $AGENT_MC_DIR/config/ftbquests/quests + $AGENT_MC_DIR/kubejs/assets/...
+  else -> pack/extracted/overrides/... (pack-zip extraction layout)
+Missing lang file is tolerated (keys stay literal).
+
+Usage: AGENT_MC_DIR=/path/to/minecraft python tools/build_quest_graph.py
+       AGENT_QUEST_GRAPH_OUT=/tmp/graph.json python tools/build_quest_graph.py
 """
 import json
+import os
 import re
 import sys
 from collections import deque
@@ -15,11 +23,9 @@ from pathlib import Path
 import snbt
 
 ROOT = Path(__file__).resolve().parent.parent
-QUESTS = ROOT / "pack/extracted/overrides/config/ftbquests/quests"
-LANG = ROOT / "pack/extracted/overrides/kubejs/assets/ftbquestlocalizer/lang/en_us.json"
 OUT = ROOT / "data/quest_graph.json"
 
-FORMAT_CODES = re.compile(r"&[0-9a-fk-or]")
+FORMAT_CODES = re.compile(r"&#(?:[0-9a-fA-F]{6}|[0-9a-fA-F]{3})|&[0-9a-fk-or]")
 LANG_KEY = re.compile(r"^\{(.+)\}$")
 
 
@@ -78,14 +84,25 @@ def quest_fallback_title(quest_parsed):
 
 
 def main():
-    lang = json.loads(LANG.read_text(encoding="utf-8"))
+    mc = os.environ.get("AGENT_MC_DIR")
+    if mc:
+        base = Path(mc)
+        quests = base / "config" / "ftbquests" / "quests"
+        lang_path = base / "kubejs" / "assets" / "ftbquestlocalizer" / "lang" / "en_us.json"
+        pack_name = base.parent.name
+    else:
+        quests = ROOT / "pack/extracted/overrides/config/ftbquests/quests"
+        lang_path = ROOT / "pack/extracted/overrides/kubejs/assets/ftbquestlocalizer/lang/en_us.json"
+        pack_name = "Reclamation 2.3.2"
+    out = Path(os.environ.get("AGENT_QUEST_GRAPH_OUT") or OUT)
+    lang = json.loads(lang_path.read_text(encoding="utf-8")) if lang_path.exists() else {}
     chapters_out = []
     all_ids = {}
     dep_edges = []
 
-    chapter_files = sorted(QUESTS.glob("chapters/*.snbt"))
+    chapter_files = sorted(quests.glob("chapters/*.snbt"))
     if not chapter_files:
-        sys.exit(f"no chapter files under {QUESTS}")
+        sys.exit(f"no chapter files under {quests}")
 
     for path in chapter_files:
         data = snbt.load(path)
@@ -142,7 +159,7 @@ def main():
     has_cycle = seen != len(all_ids)
 
     graph = {
-        "pack": "Reclamation 2.3.2",
+        "pack": pack_name,
         "minecraft": "1.20.1",
         "modloader": "forge-47.4.0",
         "chapters": chapters_out,
@@ -156,11 +173,11 @@ def main():
         },
     }
 
-    OUT.parent.mkdir(parents=True, exist_ok=True)
-    OUT.write_text(json.dumps(graph, indent=1, ensure_ascii=False), encoding="utf-8")
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(graph, indent=1, ensure_ascii=False), encoding="utf-8")
 
     s = graph["stats"]
-    print(f"wrote {OUT}")
+    print(f"wrote {out}")
     print(f"chapters={s['chapters']} quests={s['quests']} edges={s['dependency_edges']} "
           f"roots={s['root_quests']} cycle={s['has_cycle']}")
     if dangling:

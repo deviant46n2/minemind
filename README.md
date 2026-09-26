@@ -1,147 +1,136 @@
-# MineMind ⛏️🧠
+# CoopBot — AI co-op companion for modded Minecraft
 
-**An autonomous AI player for _modded_ Minecraft.**
+**A fork of [MineMind](https://github.com/Boyan253/minemind) that joins your
+world as a real second player.**
 
-MineMind reads your modpack's quest book, plans with an LLM, and sends a
-server-side AI companion to do the work — mining, crafting (modded recipes
-included), fighting, hauling — while you keep playing. It is, as far as we
-know, the first open agent that plays **modpacks**, not just vanilla.
+CoopBot launches its own Minecraft client, joins your single-player world over
+LAN as the player **CoopBot**, reads your pack's FTB Quests book, plans with a
+local LLM, and works the quest frontier alongside you — mining, checking off
+quests, requesting crafting help in chat, recovering from failure.
 
-> `/agent spawn Bob` → the planner reads 558 FTB quests → Bob walks off,
-> mines 16 dead logs, crafts them through a two-step modded recipe chain,
-> comes back and hands you the result. Nobody touched the keyboard.
-
----
-
-## Why this exists
-
-Every well-known Minecraft AI project is **vanilla-only**:
-
-| Project | Why it can't play your modpack |
-|---|---|
-| Voyager, Mindcraft, mineflayer bots | Speak the vanilla protocol — can't even join a Forge server |
-| Baritone / AltoClef | Brilliant executors, but vanilla item catalogues and Fabric-only builds |
-| STEVE-1, JARVIS-VLA, pixel agents | Research models: vanilla training data, need an RTX 3090, ~5 FPS |
-| AI-Player, ChatClef companions | Fabric-only, vanilla capabilities, cloud-locked brains |
-
-Modded Minecraft — custom blocks, kubejs recipes, machine GUIs, 500-quest
-progression books — is where the actually interesting automation problems
-live. MineMind targets exactly that gap.
-
-## What it does today
-
-- **Reads the whole quest book offline.** FTB Quests SNBT → dependency DAG
-  (chapters, quests, item tasks, rewards). The planner always knows the exact
-  frontier of available quests — no screen reading, no guessing.
-- **Plans with any LLM.** Claude (API or your Claude Code login), Groq's free
-  tier, or anything you wire into one small provider file. Sonnet-class models
-  are the sweet spot: the prompt carries the world facts and action vocabulary,
-  so the model plans rather than reasons from scratch
-  (`RECLAMATION_CLAUDE_MODEL=claude-sonnet-4-6`).
-- **Acts through a real body.** A [PlayerEngine](https://www.curseforge.com/minecraft/mc-mods/playerengine)
-  companion entity — server-side, pathfinding by Automatone (Baritone fork),
-  AltoClef task chains — plus our `agentlink` micro-mod that exposes it to the
-  planner:
-  - `/agent mine <block> [n]` — mine **any** registered block, modded ids included
-  - `/agent craft <item> [n]` — craft **any** recipe from the game's RecipeManager
-    (kubejs/datapack recipes work), resolving intermediate ingredients
-    **recursively** (log → scrap → planks happens automatically)
-  - `/agent take|store <item> [n]` — move items between the agent and nearby
-    chests or machine slots (any `IItemHandler`)
-  - `/agent give <item> [n]` — hand the loot to the player (quests check *your* inventory)
-  - `/agent run <cmd>` — the whole AltoClef command set: `follow`, `goto`,
-    `attack`, `farm`, `deposit`, `equip`, ...
-- **Verifies everything.** Inventory deltas, quest-save reads, chat-response
-  checks. Failed steps trigger replanning; repeatedly failing quests get set
-  aside instead of looping.
-- **Steer it from chat.** Type `.goal get me copper tools` in-game and the planner
-  obeys; `.goal clear` returns it to autonomous questing. Progress updates and
-  an end-of-session summary land in chat; every completed quest takes a screenshot.
-- **Escalates gracefully.** What it can't do yet (machine GUIs, claiming
-  quest rewards), it asks for in chat and waits for your `.done`.
-
-Live-tested on **Reclamation** (Forge 1.20.1, 165 mods, 558 quests) — the
-companion autonomously mined modded blocks, crafted through modded recipe
-chains, and progressed real quests.
-
-## Architecture
+Built and verified against **EMC SubTerra Tech** (CurseForge · MC 1.20.1 ·
+Forge 47.4.16 · 204 mods · 645 quests), but the quest/recipe plumbing is
+pack-agnostic (any FTB Quests pack).
 
 ```
 ┌─ your PC ────────────────────────────────────────────────────────────┐
 │                                                                      │
-│  daemon.py  ──plans──▶  LLM (Claude / Groq / local)                  │
+│  daemon.py  ──plans──▶  LLM (local llama-server / API)               │
 │    │  ▲                                                              │
 │    │  └── quest_graph.json  (built offline from the pack's           │
-│    │       FTB Quests SNBT — full dependency DAG)                    │
+│    │       FTB Quests files — full dependency DAG)                   │
 │    ▼                                                                 │
-│  TCP 127.0.0.1:48750  (JSON lines)                                   │
+│  TCP 127.0.0.1:48750  (JSON lines request/response)                  │
 │    ▲                                                                 │
-│ ┌──┴───────────────── Minecraft (Forge) ──────────────────────────┐  │
-│ │ Minescript bridge  ── chat/state/inventory I/O                  │  │
-│ │ agentlink mod      ── /agent commands → PlayerEngine controller │  │
-│ │ PlayerEngine       ── companion entity: Automatone pathfinding, │  │
-│ │                       AltoClef task chains, own inventory       │  │
-│ └──────────────────────────────────────────────────────────────────┘ │
+│ ┌──┴────────────── CoopBot's Minecraft client ────────────────────┐  │
+│ │ Minescript + agent_bridge  ── chat/state/inventory I/O          │  │
+│ │ (joined over LAN via mcwifipnp offline-auth, op level 2)        │  │
+│ └─────────────────────────────────────────────────────────────────┘  │
 └──────────────────────────────────────────────────────────────────────┘
 ```
 
-The LLM never clicks pixels. Perception is files and registries (quest SNBT,
-RecipeManager, capabilities); action is deterministic game logic. The model
-only does what models are good at: deciding what to do next.
+The LLM never clicks pixels and never types keystrokes. Perception is files
+and registries (quest DAG, save state, live inventory); action is deterministic
+bridge commands. The model only decides **what to do next**.
+
+## What works (verified, not aspirational)
+
+- [x] **Join**: own client joins your open world over LAN. OpenToLAN + mcwifipnp
+  forces offline auth so the non-Mojang profile connects; LAN port 25565.
+- [x] **Bridge**: Minescript `agent_bridge` autoruns at world join
+  (`[*]=\agent_bridge`), reconnects if the daemon restarts (tested).
+- [x] **Quest graph**: `tools/build_quest_graph.py` → `data/quest_graph.json`
+  (22 chapters, 645 quests, dependency DAG, frontier computation).
+- [x] **Local planning**: Qwen3-14B (llama-server, OpenAI-compatible) emits
+  valid multi-step quest plans.
+- [x] **quest_checkmark full chain** — daemon → bridge → `/ftbquests
+  change_progress @s complete <id>` → server accepted → progress flushed to
+  the world save and read back by the frontier logic. Requires **op level ≥ 2**
+  (see Gotchas — this was the one real bug and it was environmental).
+- [x] **Failure handling**: rejected commands / timeouts → retry once →
+  replan; logs every step result.
+- [x] **Human-assist escalation**: crafting/smelting waits for you to type
+  `.done` in chat instead of silently failing.
+- [x] **Tests**: `test/` covers launch contract, bridge reconnect, quest-graph
+  build, local-LLM provider selection — all passing.
+- [ ] Movement/inventory actions exercised end-to-end in a daemon run
+  (implemented upstream; `container_click_slot` bridge capability is missing).
+- [ ] Quest reward auto-claiming, machine GUI automation.
 
 ## Quick start
 
-**Requirements:** a Forge 1.20.1 instance, Python 3.10+, JDK 17+ (only to
-build the mod), and one of: `GROQ_API_KEY` (free), `ANTHROPIC_API_KEY`, or a
-logged-in Claude Code CLI.
+Requirements: Python 3.10+, a Forge 1.20.1 instance with Minescript + mcwifipnp,
+Java 17, and either a local llama-server or an API key.
 
 ```bash
-git clone https://github.com/Boyan253/minemind && cd minemind
-
-# 1. mods into your instance's mods/ folder:
-#    - PlayerEngine + Player2NPC (CurseForge, Forge 1.20.1)
-#    - Baritone (optional, for player-body fallback) + Minescript
-#    - agentlink: cd agentlink-mod && ./gradlew build   → build/libs/*.jar
-
-# 2. point the tools at your instance and install the bridge
 export AGENT_MC_DIR="/path/to/instance/minecraft"
-python tools/install_bridge.py
 
-# 3. build the quest graph from your pack (FTB Quests packs)
-python tools/build_quest_graph.py
+# 1. build the quest graph from your pack
+python3 tools/build_quest_graph.py
 
-# 4. run the brain, then in-game chat:  \agent_bridge
-export GROQ_API_KEY=...        # or ANTHROPIC_API_KEY, or claude-cli login
-python agent/daemon.py
+# 2. start your world, open it to LAN (mcwifipnp keeps it offline-authable)
+# 3. launch the companion client and wait until it has joined
+python3 tools/launch.py --join 127.0.0.1:25565 --heap 6G --wait --shot joined
+
+# 4. grant it editor permission (once per world — see Gotchas)
+#    in your in-game chat:  /op CoopBot
+
+# 5. run the brain (the bridge autoruns when the bot joins; if the daemon
+#    starts first it simply waits for the connection)
+export LOCAL_LLM_URL=http://127.0.0.1:8081/v1/chat/completions
+export LOCAL_LLM_MODEL=qwen3-14b
+python3 agent/daemon.py --max-cycles 3 --body player
 ```
 
-The daemon spawns a companion if none exists and starts working the quest
-frontier. Type `#stop` / `/agent stop` in chat any time to halt it.
+Useful flags:
 
-## Status
+- `--body player` — the bot's own body (CoopBot) executes steps (default
+  `companion` spawns a PlayerEngine NPC instead).
+- `--plan plan.json` — run one fixed plan and exit (deterministic repro).
+- `--mp` — dedicated-server mode: progress ledger instead of reading saves.
+- Chat steering in-game: `.goal get me …`, `.goal clear`, `#stop`.
 
-Early alpha, moving fast. Honest state of the world:
+Run the tests:
 
-- [x] Quest graph extraction (FTB Quests), frontier planning, LLM planner
-- [x] Companion body: mine (modded), craft (modded, recursive), take/store, give
-- [x] Multiplayer mode (progress ledger + no-OP fallbacks)
-- [x] Death detection, danger pause, verified human-assist steps
-- [ ] Machine automation (insert/extract works; machine recipes next)
-- [ ] Quest reward auto-claiming
-- [ ] Other quest mods (HQM, Better Questing)
-- [ ] Pack profiles — fully config-driven multi-pack support
+```bash
+for t in test/test_*.py; do python3 "$t"; done
+```
 
-## Credits
+## Gotchas (learned the hard way)
 
-MineMind stands on excellent shoulders:
-[PlayerEngine](https://github.com/Goodbird-git/PlayerEngine) by Goodbird ·
-[Automatone](https://github.com/Ladysnake/Automatone) by Ladysnake ·
+- **`/ftbquests change_progress` is op-gated (level ≥ 2).** Without it the
+  brigadier parser stops after `ftbquests` and vanilla reports the error with
+  `<--[HERE]` at the very end of the input — which looks exactly like a
+  malformed command. Run `/op CoopBot` once and the same command returns
+  `Progress has been changed!`. The command syntax itself was always correct.
+- **Never kill the game by process name.** Your own client and the bot share
+  `java`; kill only PIDs whose cmdline contains the bot instance path.
+- **LAN port**: mcwifipnp publishes on 25565; the bot client passes
+  keyboard input unreliably, so the bridge is wired as an autorun instead.
+- **World save is shared**: don't disk-edit `saves/` while your client has the
+  world open; reads are fine.
+- **Crafting is intentionally human-assisted**: the bridge lacks
+  `container_click_slot`, so `craft`/`smelt` steps ask you in chat and wait
+  for `.done` (15 min timeout, then replan).
+
+## Layout
+
+| Path | What |
+|---|---|
+| `agent/` | daemon, planner prompts, actions, world/quest state |
+| `bridge/minescript/agent_bridge.py` | in-game bridge (copied into the instance by `tools/install_bridge.py`) |
+| `tools/` | launch client, build quest graph, setup instance |
+| `data/` | quest graph + session logs (generated, gitignored) |
+| `instance/` | the bot's Minecraft instance (generated, gitignored) |
+| `test/` | runnable verification scripts (`python3 test/…`) |
+
+## Credits & license
+
+Forked from [MineMind](https://github.com/Boyan253/minemind) (MIT). MineMind
+stands on [PlayerEngine](https://github.com/Goodbird-git/PlayerEngine) ·
+[Automatone](https://github.com/Ladysnake/Automatone) ·
 [AltoClef](https://github.com/gaucho-matrero/altoclef) ·
 [Baritone](https://github.com/cabaletta/baritone) ·
 [Minescript](https://minescript.net) ·
-[FTB Quests](https://github.com/FTBTeam/FTB-Quests)
-
-## License
-
-MIT for everything in this repo. PlayerEngine/Player2NPC (LGPL-3.0) and other
-mods are **not** bundled — download them from their own pages.
+[FTB Quests](https://github.com/FTBTeam/FTB-Quests) · mcwifipnp. Mod jars are
+**not** bundled.

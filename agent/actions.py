@@ -39,15 +39,26 @@ class Actions:
         # "minecraft:cobblestone") — compare on the bare name everywhere
         return str(item_id).split(":")[-1]
 
+    def _state(self):
+        """state read that auto-dismisses a lingering GUI (Game Menu etc.).
+
+        The bot's window can sit at the Game Menu; OS-level Escape/clicks
+        would steal focus from the human's game, so the bridge closes it
+        in-process (Screen.onClose) whenever we notice it during reads."""
+        res = self.bridge.call("state") or {}
+        if res.get("open_screen"):
+            self.bridge.call("close_screen")
+        return res
+
     def _inventory(self):
-        raw = (self.bridge.call("state") or {}).get("inventory", {})
+        raw = self._state().get("inventory", {})
         out = {}
         for k, v in raw.items():
             out[self._bare(k)] = out.get(self._bare(k), 0) + v
         return out
 
     def _position(self):
-        return (self.bridge.call("state") or {}).get("position")
+        return self._state().get("position")
 
     def _wait(self, predicate, timeout, poll=2.0, desc=""):
         deadline = time.time() + timeout

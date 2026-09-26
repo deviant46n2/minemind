@@ -250,6 +250,7 @@ def main():
     caps = bridge.call("probe")
     missing = [k for k, v in (caps or {}).items() if not v]
     log(f"bridge capabilities OK; missing: {missing or 'none'}")
+    bridge.call("close_screen")  # best-effort: leave the bot out of any GUI
 
     if args.survey:
         survey(bridge)

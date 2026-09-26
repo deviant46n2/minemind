@@ -1,12 +1,14 @@
-"""LLM backend for the planner — Groq (free tier), Anthropic API, or the
-local Claude Code CLI (uses the user's Claude subscription login as a proxy;
-no API key needed).
+"""LLM backend for the planner — local llama.cpp first, then cloud fallbacks
+(Groq free tier, Gemini free tier, Anthropic API, or the local Claude Code CLI).
 
 Selection order:
-  RECLAMATION_LLM=groq|anthropic|claude-cli    explicit override
-  else: groq if GROQ_API_KEY is set, else anthropic if ANTHROPIC_API_KEY is
-  set, else claude-cli if the `claude` CLI is on PATH.
+  RECLAMATION_LLM=local|groq|anthropic|claude-cli    explicit override
+  else: local if LOCAL_LLM_URL is set (OpenAI-compatible, e.g. llama-server),
+  then gemini/groq/anthropic if their API keys are set, else claude-cli if
+  the `claude` CLI is on PATH.
 
+Local: LOCAL_LLM_URL (e.g. http://127.0.0.1:8081/v1/chat/completions),
+  LOCAL_LLM_MODEL for the model name sent to the endpoint.
 Groq: GROQ_MODEL, default llama-3.3-70b-versatile.
 Anthropic API: RECLAMATION_PLANNER_MODEL, default claude-opus-4-8.
 claude-cli: RECLAMATION_CLAUDE_MODEL to override the CLI's default model.
@@ -24,16 +26,18 @@ GEMINI_DEFAULT_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3-flash")
 ANTHROPIC_DEFAULT_MODEL = os.environ.get("RECLAMATION_PLANNER_MODEL", "claude-opus-4-8")
 
 
-KNOWN = ("gemini", "groq", "anthropic", "claude-cli")
+KNOWN = ("local", "gemini", "groq", "anthropic", "claude-cli")
 
 
 def provider():
     """Single provider name, or a comma-separated failover chain
-    (e.g. RECLAMATION_LLM='gemini,groq,claude-cli')."""
+    (e.g. RECLAMATION_LLM='local,gemini')."""
     p = os.environ.get("RECLAMATION_LLM", "").lower().replace(" ", "")
     if p:
         return p
     chain = []
+    if os.environ.get("LOCAL_LLM_URL"):
+        chain.append("local")
     if os.environ.get("GEMINI_API_KEY"):
         chain.append("gemini")
     if os.environ.get("GROQ_API_KEY"):
@@ -43,13 +47,16 @@ def provider():
     if shutil.which("claude"):
         chain.append("claude-cli")
     if not chain:
-        raise RuntimeError("no LLM configured — set GEMINI_API_KEY (free: aistudio.google.com), "
+        raise RuntimeError("no LLM configured — set LOCAL_LLM_URL (local llama-server), "
+                           "GEMINI_API_KEY (free: aistudio.google.com), "
                            "GROQ_API_KEY (free: console.groq.com), ANTHROPIC_API_KEY, "
                            "or install/login the Claude Code CLI")
     return ",".join(chain)
 
 
 def _dispatch(p, system, prompt, max_tokens):
+    if p == "local":
+        return _local(system, prompt, max_tokens)
     if p == "groq":
         return _groq(system, prompt, max_tokens)
     if p == "gemini":
@@ -75,6 +82,30 @@ def complete(system, prompt, max_tokens=4000, chain=None):
             if len(chain) > 1:
                 print(f"[llm] {p} failed ({str(exc)[:120]}) — trying next provider")
     raise last_error
+
+
+def _local(system, prompt, max_tokens):
+    """OpenAI-compatible local endpoint (llama-server / Ollama /v1). No auth;
+    no response_format (llama-server rejects unknown fields). Timeout 300s —
+    a 27B local model can take minutes for a 4k-token plan."""
+    body = json.dumps({
+        "model": os.environ.get("LOCAL_LLM_MODEL", "local-model"),
+        "max_tokens": max_tokens,
+        # Qwen3 thinking burns the token budget on reasoning_content and can
+        # truncate the JSON answer — planner wants the answer directly
+        "chat_template_kwargs": {"enable_thinking": False},
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": prompt},
+        ],
+    }).encode()
+    req = urllib.request.Request(
+        os.environ["LOCAL_LLM_URL"], data=body,
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=300) as resp:
+        data = json.load(resp)
+    return data["choices"][0]["message"]["content"]
 
 
 def _groq(system, prompt, max_tokens):
