@@ -943,6 +943,13 @@ class Actions(ActionExecutor):
         self.say(f"[agent] {step.get('text', '')}")
         return True, "said"
 
+    def empty_hand(self, step):
+        """Put the held item away so right-clicks can't fire it."""
+        if self._safe_hand():
+            hand = self.bridge.call("hand") or {}
+            return True, f"hand: {hand.get('item') or 'empty'}"
+        return False, "no room: every slot is full"
+
     def manual(self, step):
         reason = step.get("reason", "unsupported action")
         self.say(f"[agent] NEED HELP: {reason} — do it, then reply in chat "

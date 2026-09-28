@@ -78,7 +78,8 @@ implements these and nothing else):
 - {"action": "quest_checkmark", "quest_id": "HEX"}                   # checkmark tasks: /ftbquests change progress (equivalent to clicking the book)
 - {"action": "manual", "reason": "why automation can't do this yet"} # escalate to human
 - {"action": "ask", "question": "what you need to know"}             # ask the PLAYER in chat; their reply completes the step — use this instead of guessing whenever a step depends on something unknowable (a location, which machine, a yes/no)
-- {"action": "reply", "text": "what you say"}                       # just ANSWER in chat (status questions, confirmations, "did you...?") — never emit a decoy action to avoid answering
+- {"action": "reply", "text": "what you say"}                       # just ANSWER in chat (status questions, confirmations, "did you...?") — never emit a decoy action to avoid answering. Reports COMPLETED facts only — never "I will..." promises; if action is needed, emit the action steps instead
+- {"action": "empty_hand"}                                          # put the held item away (empty hotbar slot, or stash to main inventory) so right-clicks can't fire a held book/table
 - {"action": "inspect", "at": {"x":..,"y":..,"z":..}}               # report the block id at coordinates ("at" optional — without it, reports what you are looking at). Use this to VERIFY a machine/container is really there before clicking it
 """
 

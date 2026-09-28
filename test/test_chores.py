@@ -500,6 +500,30 @@ def test_reply_answers_in_chat_and_completes():
     assert any("not yet" in t for t in said), f"reply must speak: {said}"
 
 
+def test_empty_hand_puts_the_held_item_away():
+    bridge = FakeBridge()
+    bridge.slots = [{"slot": s, "item": f"item_{s}", "count": 1,
+                     "selected": s == 0} for s in range(9)]
+    bridge.hand_item = None  # stash leaves the hand empty
+    act = make_actions(bridge)
+    ok, note = act.run({"action": {"action": "empty_hand"}})
+    assert ok is True, (ok, note)
+    assert "empty" in note, note
+    ops = [(op, kw.get("slot")) for op, kw in bridge.calls
+           if op in ("select_slot", "slot_to_hotbar")]
+    assert ("select_slot", 0) in ops and ("slot_to_hotbar", 9) in ops, ops
+
+
+def test_empty_hand_reports_a_full_inventory():
+    bridge = FakeBridge()
+    bridge.slots = [{"slot": s, "item": f"item_{s}", "count": 1,
+                     "selected": s == 0} for s in range(36)]
+    bridge.hand_item = "item_0"
+    act = make_actions(bridge)
+    ok, note = act.run({"action": {"action": "empty_hand"}})
+    assert ok is False and "full" in note, (ok, note)
+
+
 def test_chore_prompt_shows_worked_examples():
     prompt = prompts_mod.build_chore_prompt("put sand in the chest", [], {})
     assert "put_in_chest" in prompt and "reply" in prompt, prompt[:800]
@@ -574,6 +598,10 @@ if __name__ == "__main__":
     print("PASS test_gui_interact_reports_search_failure")
     test_reply_answers_in_chat_and_completes()
     print("PASS test_reply_answers_in_chat_and_completes")
+    test_empty_hand_puts_the_held_item_away()
+    print("PASS test_empty_hand_puts_the_held_item_away")
+    test_empty_hand_reports_a_full_inventory()
+    print("PASS test_empty_hand_reports_a_full_inventory")
     test_chore_prompt_shows_worked_examples()
     print("PASS test_chore_prompt_shows_worked_examples")
     test_chore_system_states_the_gui_boundary()
