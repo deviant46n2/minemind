@@ -443,6 +443,15 @@ class Actions(ActionExecutor):
     def interact(self, step):
         target = step.get("at")
         if isinstance(target, dict):
+            target = self._block_pos(target)
+            reach = self._reach(self._position() or {}, target)
+            if reach > 4.5:
+                # clicking from here burns aims on thin air (observed live:
+                # table at 11,66,6 worked from the crusher) — the plan needs
+                # a goto first, and says so instead of failing blind
+                return False, (f"too far ({reach:.1f}m) from the block at "
+                               f"{target['x']},{target['y']},{target['z']} — "
+                               f"goto first")
             if step.get("gui"):
                 # opening is opening: every GUI goes through the same
                 # aim-search as take/put, never a single center look
@@ -794,6 +803,8 @@ class Actions(ActionExecutor):
             self._tap("use")
             time.sleep(0.8)
             if self.bridge.call("container") is not None:
+                self.log(f"opened container at {at['x']},{at['y']},{at['z']} "
+                         f"via aim +{dx},+{dy},+{dz}")
                 return None
             screen = (self.bridge.call("state") or {}).get("open_screen")
             tried.append(f"screen={screen!r} aiming at {self._aim_note()}")
@@ -801,18 +812,18 @@ class Actions(ActionExecutor):
         return (f"could not open container at {at['x']},{at['y']},{at['z']}"
                 f"{stuck_note}: tried {len(aims)} aims [{'; '.join(tried)}]")
 
-    def _stand_ready(self, at):
+    def _stand_ready(self, at, what="container"):
         """Walk to a container block and confirm it is within use range.
 
         None when it can be opened, else why it cannot.
         """
         if not (isinstance(at, dict) and "x" in at):
-            return "no coordinates for the container"
+            return f"no coordinates for the {what}"
         if not self._approach(at):
-            return f"could not get near the container at {at['x']},{at['y']},{at['z']}"
+            return f"could not get near the {what} at {at['x']},{at['y']},{at['z']}"
         reach = self._reach(self._position() or {}, at)
         if reach > 4.5:
-            return f"still {reach:.1f}m from the container at {at['x']},{at['y']},{at['z']}"
+            return f"still {reach:.1f}m from the {what} at {at['x']},{at['y']},{at['z']}"
         return None
 
     def take_from_chest(self, step):

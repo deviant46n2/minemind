@@ -46,6 +46,7 @@ class FakeBridge:
         self.aim_gated = False  # ...but only when aimed at good_aim
         self.good_aim = None
         self.last_look = None
+        self.pos = {}  # state["position"]
         self._polls = 0
 
     def call(self, op, **kw):
@@ -62,7 +63,7 @@ class FakeBridge:
             return {"entries": [e for e in self.chat if e["n"] > since],
                     "latest": latest}
         if op == "state":
-            return {"inventory": {}, "position": {},
+            return {"inventory": {}, "position": dict(self.pos),
                     "open_screen": self.screen}
         if op == "inventory_slots":
             return list(self.slots)
@@ -220,6 +221,7 @@ def test_at_coordinates_are_floored_to_block_aim():
     """look_at aims at block centers (x+0.5); a fractional "player position"
     as `at` aims into the next block over and the ray misses."""
     bridge = FakeBridge()
+    bridge.pos = {"x": 9.0, "y": 66.0, "z": 8.0}
     act = actions_mod.Actions(bridge, lambda q: set(), lambda *a, **k: None,
                               body="player", player_name=PLAYER)
     assert act._block_pos({"x": 9.3, "y": 66.0, "z": 8.4}) == \
@@ -444,6 +446,7 @@ def test_gui_interact_uses_the_aim_search():
     take/put — a single center look bypasses every fix and fails the
     same way forever."""
     bridge = FakeBridge()
+    bridge.pos = {"x": 4.5, "y": 66.0, "z": 0.5}
     bridge.open_ok = True
     bridge.aim_gated = True
     bridge.good_aim = (5.9, 69.05, 0.9)
@@ -459,6 +462,7 @@ def test_gui_interact_uses_the_aim_search():
 
 def test_gui_interact_reports_search_failure():
     bridge = FakeBridge()
+    bridge.pos = {"x": 4.5, "y": 66.0, "z": 0.5}
     bridge.open_ok = True
     bridge.aim_gated = True
     bridge.good_aim = (999, 999, 999)
@@ -466,6 +470,19 @@ def test_gui_interact_reports_search_failure():
     ok, note = act.interact({"block": "minecraft:chest", "gui": True,
                              "at": {"x": 5, "y": 69, "z": 0}})
     assert ok is False and "5,69,0" in note, (ok, note)
+
+
+def test_interact_refuses_a_block_out_of_reach():
+    """Clicking a block 8m away burns 11 aims on thin air (observed live:
+    table at 11,66,6 from the crusher). Fail fast with goto guidance."""
+    bridge = FakeBridge()  # pos {} = far from everything
+    act = make_actions(bridge)
+    ok, note = act.interact({"block": "transmutation_table", "gui": True,
+                             "at": {"x": 11, "y": 66, "z": 6}})
+    assert ok is False, (ok, note)
+    assert "too far" in note and "goto" in note, note
+    assert not [1 for op, _ in bridge.calls if op == "look_at"], (
+        f"must not aim at the unreachable: {bridge.calls}")
 
 
 def test_manual_completes_on_any_player_reply():
@@ -606,4 +623,6 @@ if __name__ == "__main__":
     print("PASS test_chore_prompt_shows_worked_examples")
     test_chore_system_states_the_gui_boundary()
     print("PASS test_chore_system_states_the_gui_boundary")
+    test_interact_refuses_a_block_out_of_reach()
+    print("PASS test_interact_refuses_a_block_out_of_reach")
     print("PASS")

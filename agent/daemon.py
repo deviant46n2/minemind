@@ -244,7 +244,10 @@ def run_plan(bridge, world, plan, actions, mark_complete=None):
         ok, note = actions.run(step)
         log(f"  -> {'OK' if ok else 'FAIL'}: {note}")
         if (not ok and step.get("action", {}).get("action") != "ask"
-                and not getattr(actions, "interrupted", None)):
+                and not getattr(actions, "interrupted", None)
+                # an exhausted aim-search already tried everything twice
+                # over would just re-spam the server with identical clicks
+                and "could not open container at" not in str(note)):
             log("  retrying once...")
             ok, note = actions.run(step)
             log(f"  -> {'OK' if ok else 'FAIL'}: {note}")
