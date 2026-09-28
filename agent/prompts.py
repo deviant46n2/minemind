@@ -169,6 +169,12 @@ Rules for chore work (the player talks, you do — nothing else is your job):
   "standing on" or "at" a block means the block BELOW their feet (feet_y - 1).
   When unsure what is really at a coordinate, "inspect" it first — clicking
   blind, failing, and replanning the same click is a planning failure.
+- state["nearby"] lists who is around with distances: "come here" means goto
+  the player's position; "at my feet" / "this" (for the player) means the
+  block below their feet (feet_y - 1, floored).
+- The bot NEVER breaks or places blocks to get somewhere (pathing runs with
+  breaking disabled) — if it cannot arrive, say what blocks it, don't route
+  through it.
 - CHECK STORAGE FIRST, same as ever: state.base.storage_totals/containers
   before gathering or asking the human to fetch anything.
 - When the player names an item or block you cannot see in the state and that

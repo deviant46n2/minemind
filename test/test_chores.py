@@ -47,6 +47,8 @@ class FakeBridge:
         self.good_aim = None
         self.last_look = None
         self.pos = {}  # state["position"]
+        self.bot_name = "CoopBot"
+        self.entities = []  # entities op result
         self._polls = 0
 
     def call(self, op, **kw):
@@ -64,12 +66,14 @@ class FakeBridge:
                     "latest": latest}
         if op == "state":
             return {"inventory": {}, "position": dict(self.pos),
-                    "open_screen": self.screen}
+                    "open_screen": self.screen, "name": self.bot_name}
         if op == "inventory_slots":
             return list(self.slots)
         if op == "container":
             # a screen only exposes slots when it actually opened one
             return self.container if self.screen == "Chest" else None
+        if op == "entities":
+            return list(self.entities)
         if op == "look_at":
             self.last_look = (kw["x"], kw["y"], kw["z"])
             return True
@@ -485,6 +489,39 @@ def test_interact_refuses_a_block_out_of_reach():
         f"must not aim at the unreachable: {bridge.calls}")
 
 
+def test_game_state_tracks_nearby_people():
+    """'come here' and 'at my feet' are unresolvable without knowing
+    where the player is — entities within reach travel with the state."""
+    bridge = FakeBridge()
+    bridge.pos = {"x": 4.5, "y": 65.5, "z": 0.4}
+    bridge.entities = [
+        {"name": "CoopBot", "type": "player",
+         "position": [4.5, 65.5, 0.4], "health": 20.0, "uuid": "bot"},
+        {"name": "Deviant46n2", "type": "player",
+         "position": [10.5, 66.0, 7.5], "health": 20.0, "uuid": "human"},
+    ]
+    state = daemon_mod.build_game_state(bridge, None, set(), "Deviant46n2")
+    nearby = state.get("nearby", [])
+    assert len(nearby) == 1 and nearby[0]["name"] == "Deviant46n2", nearby
+    assert 9.0 < nearby[0]["distance"] < 9.6, nearby
+
+
+def test_goto_never_breaks_or_places_blocks():
+    """Baritone mines its way to the goal by default — observed live as a
+    vanished container. Pathing must not grief the base; mining stays
+    available to explicit mine steps (settings restored after)."""
+    bridge = FakeBridge(inject=(3, f"<{PLAYER}> never mind"))
+    act = make_actions(bridge)
+    act.goto({"x": 100, "y": 64, "z": 200, "timeout": 60})
+    said = [kw.get("text", "") for op, kw in bridge.calls if op == "chat"]
+    off = [t for t in said if "#set allowBreak false" in t]
+    on = [t for t in said if "#set allowBreak true" in t]
+    go = [t for t in said if t.startswith("#goto ")]
+    assert off and go and on, f"off->goto->on order required: {said}"
+    assert said.index(off[0]) < said.index(go[0]) < said.index(on[0]), said
+    assert any("#set allowPlace false" in t for t in said), said
+
+
 def test_manual_completes_on_any_player_reply():
     """manual is a conversation, not a .done gate: any reply continues the
     turn (the reply text travels, so the next plan knows what was said).
@@ -625,4 +662,8 @@ if __name__ == "__main__":
     print("PASS test_chore_system_states_the_gui_boundary")
     test_interact_refuses_a_block_out_of_reach()
     print("PASS test_interact_refuses_a_block_out_of_reach")
+    test_game_state_tracks_nearby_people()
+    print("PASS test_game_state_tracks_nearby_people")
+    test_goto_never_breaks_or_places_blocks()
+    print("PASS test_goto_never_breaks_or_places_blocks")
     print("PASS")

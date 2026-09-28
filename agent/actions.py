@@ -285,26 +285,43 @@ class Actions(ActionExecutor):
         self.bridge.call("screenshot")  # capture the moment for the session gallery
         return True, "command accepted (recorded; save file confirms on next autosave)"
 
+    def _grief(self, allow):
+        """Baritone mines/places its way to the goal by default — observed
+        live as a vanished container. Pathing steps disable breaking and
+        placing around the walk and restore after; explicit mine steps
+        never touch these settings, so mining keeps working."""
+        word = "true" if allow else "false"
+        for setting in ("allowBreak", "allowPlace", "allowParkourPlace"):
+            self.bridge.call("chat", text=f"#set {setting} {word}")
+
     def goto(self, step):
         x, y, z = step["x"], step["y"], step["z"]
-        self.bridge.call("chat", text=f"#goto {int(x)} {int(y)} {int(z)}")
-        ok = self._baritone_idle(timeout=step.get("timeout", 300))
-        if self.interrupted:
-            self.interrupt()
-            return False, f"interrupted: {self.interrupted[0][1][:120]}"
-        pos = self._position()
-        if pos and abs(pos["x"] - x) <= 4 and abs(pos["z"] - z) <= 4:
-            return True, f"arrived at {pos}"
-        return ok, f"ended at {pos}"
+        self._grief(False)
+        try:
+            self.bridge.call("chat", text=f"#goto {int(x)} {int(y)} {int(z)}")
+            ok = self._baritone_idle(timeout=step.get("timeout", 300))
+            if self.interrupted:
+                self.interrupt()
+                return False, f"interrupted: {self.interrupted[0][1][:120]}"
+            pos = self._position()
+            if pos and abs(pos["x"] - x) <= 4 and abs(pos["z"] - z) <= 4:
+                return True, f"arrived at {pos}"
+            return ok, f"ended at {pos}"
+        finally:
+            self._grief(True)
 
     def goto_block(self, step):
         block = step["block"]  # full namespaced id — Baritone needs it for modded blocks
-        self.bridge.call("chat", text=f"#goto {block}")
-        ok = self._baritone_idle(timeout=step.get("timeout", 420))
-        if self.interrupted:
-            self.interrupt()
-            return False, f"interrupted: {self.interrupted[0][1][:120]}"
-        return ok, f"pathed toward nearest {block}"
+        self._grief(False)
+        try:
+            self.bridge.call("chat", text=f"#goto {block}")
+            ok = self._baritone_idle(timeout=step.get("timeout", 420))
+            if self.interrupted:
+                self.interrupt()
+                return False, f"interrupted: {self.interrupted[0][1][:120]}"
+            return ok, f"pathed toward nearest {block}"
+        finally:
+            self._grief(True)
 
     def mine(self, step):
         block = step["block"]
@@ -726,8 +743,12 @@ class Actions(ActionExecutor):
             x, z = at["x"] + dx, at["z"] + dz
             block = self.bridge.call("getblock", x=x, y=at["y"], z=z) or ""
             if self._bare(block.split("[")[0]) in ("air", "cave_air", "void_air"):
-                self.bridge.call("chat", text=f"#goto {x} {at['y']} {z}")
-                return self._baritone_idle(timeout=180)
+                self._grief(False)
+                try:
+                    self.bridge.call("chat", text=f"#goto {x} {at['y']} {z}")
+                    return self._baritone_idle(timeout=180)
+                finally:
+                    self._grief(True)
         self.log(f"no standable air beside {at['x']},{at['y']},{at['z']}")
         return False
 

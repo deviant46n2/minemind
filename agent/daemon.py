@@ -128,7 +128,7 @@ def load_base_summary():
             "containers": containers}
 
 
-def build_game_state(bridge, world, completed):
+def build_game_state(bridge, world, completed, player_name=None):
     live = bridge.call("state") or {}
     state = {
         "completed_quests": sorted(completed),
@@ -138,6 +138,27 @@ def build_game_state(bridge, world, completed):
         "day_ticks": live.get("day_ticks"),
         "world": world.name if world else "multiplayer",
     }
+    # who is around: players (and mobs) with distances — "come here" and
+    # "at my feet" are unresolvable without this. Self excluded by name.
+    me = live.get("name")
+    pos = live.get("position") or {}
+    nearby = []
+    for e in bridge.call("entities") or []:
+        name = e.get("name") or ""
+        if not name or name == me or "[agent" in name:
+            continue
+        epos = e.get("position")
+        dist = None
+        if epos and len(epos) == 3 and pos:
+            dist = round(((pos.get("x", 0) - epos[0]) ** 2
+                          + (pos.get("y", 0) - epos[1]) ** 2
+                          + (pos.get("z", 0) - epos[2]) ** 2) ** 0.5, 1)
+        nearby.append({"name": name, "type": e.get("type", "?"),
+                       "distance": dist,
+                       "position": [round(v, 1) for v in epos] if epos else None,
+                       "is_player": bool(player_name) and name == player_name})
+    nearby.sort(key=lambda e: e["distance"] if e["distance"] is not None else 1e9)
+    state["nearby"] = nearby[:5]
     base = load_base_summary()
     if base:
         state["base"] = base
@@ -304,7 +325,7 @@ def run_chores(bridge, actions, args, world):
         instruction = "\n".join(t for t in texts if t).strip()
         if not instruction:
             continue
-        game_state = build_game_state(bridge, world, set())
+        game_state = build_game_state(bridge, world, set(), args.player_name)
         prompt = prompts.build_chore_prompt(instruction, list(history),
                                             game_state)
         log(f"chore turn {turns + 1}: {instruction[:120]} "
