@@ -735,6 +735,7 @@ class Actions(ActionExecutor):
         slots = self.bridge.call("inventory_slots") or []
         used = {s.get("slot") for s in slots if s.get("slot") in range(9)}
         held = next((s.get("slot") for s in slots if s.get("selected")), None)
+        self.log(f"hand check: held={held} hotbar_used={sorted(used)}")
         if held not in used:
             return True  # already holding nothing (or selection unknown)
         free = [s for s in range(9) if s not in used]
