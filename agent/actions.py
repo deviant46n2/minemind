@@ -359,27 +359,38 @@ class Actions(ActionExecutor):
         self.bridge.call("press", control=control, pressed=False)
 
     def _select_item(self, item_id):
-        """Put the item in hand: pick from hotbar, or move it to the hotbar."""
+        """Put the item in hand: pick from hotbar, or move it to the hotbar.
+
+        Returns True, "missing" (not in inventory at all), or
+        "select_failed" (present, but the hand won't take it — usually a
+        stuck screen eating the hotbar keys, so close those first).
+        """
         want = self._bare(item_id)
         slots = self.bridge.call("inventory_slots") or []
         match = next((s for s in slots if self._bare(s["item"]) == want), None)
         if not match:
-            return False
+            return "missing"
+        self.bridge.call("close_screen")
         if match["slot"] <= 8:
             self.bridge.call("select_slot", slot=match["slot"])
         else:
             self.bridge.call("slot_to_hotbar", slot=match["slot"])
         time.sleep(0.4)
         hand = self.bridge.call("hand")
-        return bool(hand and self._bare(hand.get("item", "")) == want)
+        if hand and self._bare(hand.get("item", "")) == want:
+            return True
+        return "select_failed"
 
     def place(self, step):
         item = step["item"]
         where = step.get("at") or step.get("where")
         if not isinstance(where, dict):  # descriptive location -> human decides spot
             return self.manual({"reason": f"place {item} at '{where}' (no coordinates given)"})
-        if not self._select_item(item):
-            return False, f"{item} not in inventory"
+        sel = self._select_item(item)
+        if sel is not True:
+            why = ("not in inventory" if sel == "missing"
+                   else "in inventory but won't come to hand (screen stuck?)")
+            return False, f"{item}: {why}"
         x, y, z = where["x"], where["y"], where["z"]
         # aim at the top face of the block below the target cell
         self.bridge.call("look_at", x=x + 0.5, y=y - 0.05, z=z + 0.5)
@@ -392,8 +403,11 @@ class Actions(ActionExecutor):
                (False, f"block at target is {placed!r} — placement failed")
 
     def use_item_on(self, step):
-        if not self._select_item(step["item"]):
-            return False, f"{step['item']} not in inventory"
+        sel = self._select_item(step["item"])
+        if sel is not True:
+            why = ("not in inventory" if sel == "missing"
+                   else "in inventory but won't come to hand (screen stuck?)")
+            return False, f"{step['item']}: {why}"
         target = step.get("at")
         if isinstance(target, dict):
             target = self._block_pos(target)
@@ -429,6 +443,7 @@ class Actions(ActionExecutor):
     def interact(self, step):
         target = step.get("at")
         if isinstance(target, dict):
+            self.bridge.call("close_screen")
             self._safe_hand()
             target = self._block_pos(target)
             self.bridge.call("look_at", x=target["x"] + 0.5, y=target["y"] + 0.5, z=target["z"] + 0.5)
@@ -731,23 +746,35 @@ class Actions(ActionExecutor):
 
         Reads `state` raw rather than through _state(), which closes any open
         screen on sight — that would undo the click we just made.
+
+        Tries several aim points, not just the block center: from below an
+        elevated chest the center ray grazes the pillar/controller under it
+        (observed live), while a bottom-corner ray slips past. Each attempt
+        closes stray screens first, so a held book can no longer hijack the
+        sequence — a miss just moves on to the next aim.
         """
+        stuck = (self.bridge.call("state") or {}).get("open_screen")
         self.bridge.call("close_screen")
         self._safe_hand()
         at = self._block_pos(at)
-        self.bridge.call("look_at", x=at["x"] + 0.5, y=at["y"] + 0.5, z=at["z"] + 0.5)
-        time.sleep(0.3)
-        self._tap("use")
-        time.sleep(0.8)
-        screen = (self.bridge.call("state") or {}).get("open_screen")
-        aim = self._aim_note()
-        if not screen:
-            return (f"nothing opened aiming at {aim} "
-                    f"(ray missed the container or the block is gone)")
-        if self.bridge.call("container") is None:
-            return (f"screen {screen!r} exposes no container slots "
-                    f"(aiming at {aim})")
-        return None
+        aims = [(0.5, 0.5, 0.5), (0.5, 0.05, 0.5),
+                (0.1, 0.05, 0.1), (0.9, 0.05, 0.1),
+                (0.1, 0.05, 0.9), (0.9, 0.05, 0.9)]
+        tried = []
+        for dx, dy, dz in aims:
+            self.bridge.call("close_screen")
+            self.bridge.call("look_at", x=at["x"] + dx, y=at["y"] + dy,
+                             z=at["z"] + dz)
+            time.sleep(0.3)
+            self._tap("use")
+            time.sleep(0.8)
+            if self.bridge.call("container") is not None:
+                return None
+            screen = (self.bridge.call("state") or {}).get("open_screen")
+            tried.append(f"screen={screen!r} aiming at {self._aim_note()}")
+        stuck_note = f" (a {stuck!r} screen was stuck open — closed it)" if stuck else ""
+        return (f"could not open container at {at['x']},{at['y']},{at['z']}"
+                f"{stuck_note}: tried {len(aims)} aims [{'; '.join(tried)}]")
 
     def _stand_ready(self, at):
         """Walk to a container block and confirm it is within use range.

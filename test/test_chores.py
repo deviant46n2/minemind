@@ -41,6 +41,11 @@ class FakeBridge:
         self.slots = []  # inventory_slots entries: {"slot","item","selected"}
         self.screen = None  # state["open_screen"]
         self.container = None  # container op result
+        self.hand_item = None  # hand op reports this
+        self.open_ok = False  # press(use) opens the Chest screen
+        self.aim_gated = False  # ...but only when aimed at good_aim
+        self.good_aim = None
+        self.last_look = None
         self._polls = 0
 
     def call(self, op, **kw):
@@ -62,12 +67,33 @@ class FakeBridge:
         if op == "inventory_slots":
             return list(self.slots)
         if op == "container":
-            return self.container
+            # a screen only exposes slots when it actually opened one
+            return self.container if self.screen == "Chest" else None
+        if op == "look_at":
+            self.last_look = (kw["x"], kw["y"], kw["z"])
+            return True
+        if op == "close_screen":
+            self.screen = None
+            return {"closed": True}
+        if op == "hand":
+            return {"item": self.hand_item, "count": 1}
+        if op == "press":
+            if (kw.get("control") == "use" and kw.get("pressed")
+                    and self.open_ok and self.screen is None
+                    and (not self.aim_gated or self._aim_ok())):
+                self.screen = "Chest"
+            return True
         if op == "getblock":
             return self.blocks.get((kw["x"], kw["y"], kw["z"]), "minecraft:air")
         if op == "targeted_block":
             return {"block": "minecraft:stone", "position": [1, 2, 3]}
         return {"ok": True}
+
+    def _aim_ok(self):
+        if self.last_look is None or self.good_aim is None:
+            return False
+        return all(abs(a - b) < 1e-9
+                   for a, b in zip(self.last_look, self.good_aim))
 
 
 def chats(bridge):
@@ -335,6 +361,56 @@ def test_wrong_screen_names_aim_and_screen():
         f"planner needs both halves of the diagnosis: {reason!r}")
 
 
+def test_open_searches_aim_points_until_the_chest_opens():
+    """Center-aim can graze an occluder below an elevated chest while a
+    bottom-corner ray slips past it — keep aiming until slots appear."""
+    bridge = FakeBridge()
+    bridge.open_ok = True
+    bridge.aim_gated = True
+    bridge.good_aim = (5.9, 69.05, 0.9)  # a bottom corner, not the center
+    bridge.container = []
+    act = make_actions(bridge)
+    assert act._open_container({"x": 5, "y": 69, "z": 0}) is None
+    looks = [kw for op, kw in bridge.calls if op == "look_at"]
+    assert len(looks) >= 2, f"must try past the blocked center: {looks}"
+
+
+def test_open_reports_every_aim_when_nothing_opens():
+    bridge = FakeBridge()
+    bridge.open_ok = True
+    bridge.aim_gated = True
+    bridge.good_aim = (999, 999, 999)  # unreachable: everything misses
+    act = make_actions(bridge)
+    reason = act._open_container({"x": 5, "y": 69, "z": 0})
+    assert reason is not None and "5,69,0" in reason, reason
+    looks = [kw for op, kw in bridge.calls if op == "look_at"]
+    assert len(looks) >= 3, f"must work the aim points, got {looks}"
+
+
+def test_select_item_closes_a_stuck_screen_first():
+    bridge = FakeBridge()
+    bridge.screen = "Materials and You"  # left open by a book misfire
+    bridge.slots = [{"slot": 7, "item": "sand", "count": 64,
+                     "selected": False}]
+    bridge.hand_item = "sand"
+    act = make_actions(bridge)
+    assert act._select_item("sand") is True
+    ops = [op for op, _ in bridge.calls]
+    assert "close_screen" in ops and "select_slot" in ops, ops
+    assert ops.index("close_screen") < ops.index("select_slot"), ops
+    assert bridge.screen is None, "stuck GUI must be gone"
+
+
+def test_select_distinguishes_missing_from_unselectable():
+    bridge = FakeBridge()
+    act = make_actions(bridge)
+    assert act._select_item("sand") == "missing"
+    bridge.slots = [{"slot": 7, "item": "sand", "count": 64,
+                     "selected": False}]
+    bridge.hand_item = "materials_and_you"  # selection never lands
+    assert act._select_item("sand") == "select_failed"
+
+
 if __name__ == "__main__":
     test_only_the_players_own_lines_steer_the_bot()
     print("PASS test_only_the_players_own_lines_steer_the_bot")
@@ -376,4 +452,12 @@ if __name__ == "__main__":
     print("PASS test_open_failure_names_what_the_ray_hits")
     test_wrong_screen_names_aim_and_screen()
     print("PASS test_wrong_screen_names_aim_and_screen")
+    test_open_searches_aim_points_until_the_chest_opens()
+    print("PASS test_open_searches_aim_points_until_the_chest_opens")
+    test_open_reports_every_aim_when_nothing_opens()
+    print("PASS test_open_reports_every_aim_when_nothing_opens")
+    test_select_item_closes_a_stuck_screen_first()
+    print("PASS test_select_item_closes_a_stuck_screen_first")
+    test_select_distinguishes_missing_from_unselectable()
+    print("PASS test_select_distinguishes_missing_from_unselectable")
     print("PASS")
