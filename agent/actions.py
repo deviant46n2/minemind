@@ -16,22 +16,71 @@ CMD_ERRORS = ("permission", "unknown command", "no such", "incorrect argument",
               "usage:", "expected", "<--[here]")
 
 
+def extract_player_lines(entries, player_name, bot_name="CoopBot"):
+    """Which chat lines count as the player talking to the bot.
+
+    Only lines FROM the player's username — the bot's own <Bot> lines, its
+    "[agent]" broadcasts and server noise must never steer it. A player
+    quoting our own prefix back at us is still noise, not an instruction.
+    With no player_name configured, any non-agent line counts (singleplayer
+    test bed).
+    """
+    out = []
+    for e in entries or []:
+        msg = e.get("message", "")
+        if "[agent" in msg:
+            continue
+        if not msg.startswith("<"):
+            continue
+        sender, sep, text = msg[1:].partition(">")
+        if not sep:
+            continue
+        if player_name and (sender != player_name or sender == bot_name):
+            continue
+        text = text.strip()
+        if text:
+            out.append((sender, text))
+    return out
+
+
 class Actions:
     def __init__(self, bridge, get_completed_quests, log, mp=False, mark_complete=None,
-                 body="companion"):
+                 body="companion", player_name=None):
         self.bridge = bridge          # BridgeClient (daemon.py)
         self.get_completed = get_completed_quests
         self.log = log
         self.mp = mp                  # multiplayer: no save files, maybe no OP
         self.body = body              # "companion" (PlayerEngine entity) | "player" (own body)
+        self.player_name = player_name  # whose chat lines count as instructions
+        self.interrupted = []  # player lines that aborted the current wait
+        self.chat_seen = 0  # chat high-water mark; the daemon syncs this to
+        # what it already processed, so waits only react to newer lines
         self.mark_complete = mark_complete or (lambda qid: None)
         self.quest_titles = {}        # id -> human title (daemon fills from the graph)
+
+    def say(self, text):
+        """User-visible message, broadcast through world chat.
+
+        `echo` only shows on the bot's own screen — joined over LAN, the
+        human host would never see requests or progress. Never pass
+        /commands here (chat would execute them); use the `chat` op
+        directly for those.
+        """
+        self.bridge.call("chat", text=text)
 
     def _qname(self, qid):
         title = self.quest_titles.get(qid)
         return f"'{title}'" if title else qid
 
     # -- helpers ------------------------------------------------------------
+
+    @staticmethod
+    def _block_pos(at):
+        """Block coords are integers — a fractional "player position" as `at`
+        aims look_at into the next block over and the ray misses."""
+        import math
+        return {"x": math.floor(at["x"]), "y": math.floor(at["y"]),
+                "z": math.floor(at["z"])}
 
     @staticmethod
     def _bare(item_id):
@@ -60,11 +109,35 @@ class Actions:
     def _position(self):
         return self._state().get("position")
 
-    def _wait(self, predicate, timeout, poll=2.0, desc=""):
+    def _wait(self, predicate, timeout, poll=2.0, desc="", interrupt=True):
         deadline = time.time() + timeout
+        self.interrupted = []
+        first = self.bridge.call("chat_log", since=0)
+        latest = first["latest"] if first else 0
+        listen = bool(self.player_name) and interrupt
+        if listen:
+            # lines that arrived while planning (after the daemon's last
+            # poll) are new instructions too — catch them before the loop
+            fresh = [e for e in (first or {}).get("entries", [])
+                     if e.get("n", 0) > self.chat_seen]
+            lines = self._player_lines(fresh)
+            if lines:
+                self.interrupted = lines
+                self.log(f"interrupted during {desc}: {lines[0][1][:100]}")
+                return False
+            self.chat_seen = latest
+        since = latest
         while time.time() < deadline:
             if predicate():
                 return True
+            if listen:
+                logs = self.bridge.call("chat_log", since=since) or {}
+                since = logs.get("latest", since)
+                lines = self._player_lines(logs.get("entries", []))
+                if lines:
+                    self.interrupted = lines
+                    self.log(f"interrupted during {desc}: {lines[0][1][:100]}")
+                    return False
             time.sleep(poll)
         self.log(f"timeout waiting for {desc} ({timeout}s)")
         return False
@@ -80,30 +153,99 @@ class Actions:
             if not logs:
                 return False
             since = logs["latest"]
+            self.chat_seen = max(self.chat_seen, since)
             # ignore our own "[agent]" prompts — they mention '.done' and the chat
             # listener captures echoes, so without this the wait confirms itself
             return any(".done" in e["message"].lower() and "[agent]" not in e["message"]
                        for e in logs["entries"])
-        return self._wait(check, timeout, poll=2, desc="player to type .done in chat")
+        # no interrupt here: chatter ("almost done") must not kill a .done
+        # wait — the confirmation IS the reply this flow is waiting for
+        return self._wait(check, timeout, poll=2, desc="player to type .done in chat",
+                          interrupt=False)
+
+    def _wait_player_reply(self, timeout=180, poll=2):
+        """Wait for ANY chat line from the player; return its text.
+
+        Unlike _wait_for_player_signal (which needs the literal ".done"),
+        this is the conversational wait: the player answering a question in
+        their own words. Our own "[agent]" lines never count. Starts from
+        the shared high-water mark, so a reply typed while planning still
+        counts (it is not an interruption — it is the answer).
+        """
+        since = self.chat_seen
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            logs = self.bridge.call("chat_log", since=since) or {}
+            since = logs.get("latest", since)
+            self.chat_seen = max(self.chat_seen, since)
+            for _, text in self._player_lines(logs.get("entries", [])):
+                return text
+            time.sleep(poll)
+        self.log(f"timeout waiting for player to reply in chat ({timeout}s)")
+        return None
+
+    def _player_lines(self, entries):
+        """This actuator's view of "the player talked to us"."""
+        return extract_player_lines(entries, self.player_name or "")
+
+    def ask(self, step):
+        """Ask the player a question in chat; the reply completes the step.
+
+        Silence gets one repeat, then the step fails (never blocks the
+        loop forever) — the next plan sees the unanswered question in the
+        conversation history and can try differently.
+        """
+        question = step.get("question", "")
+        self.say(f"[agent] {question}")
+        self.log(f"ASK: {question}")
+        reply = self._wait_player_reply(timeout=step.get("timeout", 180))
+        if reply is None:
+            self.say(f"[agent] still need an answer: {question}")
+            reply = self._wait_player_reply(timeout=step.get("timeout", 180))
+        if reply is None:
+            return False, f"player never answered: {question}"
+        return True, f"player answered: {reply}"
 
     def _baritone_idle(self, timeout):
-        """Baritone reports completion/failure in chat; watch for its messages."""
+        """Wait for a `#goto` to finish.
+
+        Baritone does not reliably announce success: on a short path it prints
+        only 'Going to: GoalBlock{...}' and then stops silently. Watching chat
+        for Done/Finished alone therefore hangs until the timeout on a path
+        that already completed (observed live: the bot arrived, no message
+        followed, 180s burned). Baritone's real arrival signal is that the
+        player's position stops changing, so accept that once pathing has
+        demonstrably started.
+        """
         marker = {"since": 0}
         first = self.bridge.call("chat_log", since=0)
         marker["since"] = first["latest"] if first else 0
+        last, stable, started, moved = None, 0, False, False
 
         def check():
+            nonlocal last, stable, started, moved
             logs = self.bridge.call("chat_log", since=marker["since"])
-            if not logs:
-                return False
-            marker["since"] = logs["latest"]
-            for entry in logs["entries"]:
+            if logs:
+                marker["since"] = logs["latest"]
+            for entry in (logs or {}).get("entries", []):
                 msg = entry["message"]
-                if "[Baritone]" in msg and any(w in msg for w in
-                        ("Done", "Finished", "canceled", "Cancelled", "No path", "Unable")):
+                if "[Baritone]" not in msg:
+                    continue
+                if any(w in msg for w in
+                       ("Done", "Finished", "canceled", "Cancelled", "No path", "Unable")):
                     self.log(f"baritone: {msg.strip()[:120]}")
                     return True
-            return False
+                if any(w in msg for w in ("Goal", "Going")):
+                    started = True
+            pos = self._position() or {}
+            key = tuple(round(pos.get(k, 0), 2) for k in ("x", "y", "z"))
+            if last is not None:
+                if key == last:
+                    stable += 1
+                else:
+                    moved, stable = True, 0
+            last = key
+            return stable >= 3 and (moved or started)
         return self._wait(check, timeout, desc="baritone completion")
 
     # -- executors ----------------------------------------------------------
@@ -121,8 +263,8 @@ class Actions:
         chat = " | ".join(e["message"] for e in logs["entries"])
         if any(w in chat.lower() for w in CMD_ERRORS):
             if self.mp:
-                self.bridge.call("echo", text=f"[agent] no OP for /ftbquests — click quest "
-                                              f"{self._qname(qid)} in the book, then type .done")
+                self.say(f"[agent] no OP for /ftbquests — click quest "
+                         f"{self._qname(qid)} in the book, then type .done")
                 if not self._wait_for_player_signal():
                     return False, f"no OP and player never confirmed quest {self._qname(qid)}"
                 self.mark_complete(qid)
@@ -136,6 +278,9 @@ class Actions:
         x, y, z = step["x"], step["y"], step["z"]
         self.bridge.call("chat", text=f"#goto {int(x)} {int(y)} {int(z)}")
         ok = self._baritone_idle(timeout=step.get("timeout", 300))
+        if self.interrupted:
+            self.bridge.call("chat", text="#stop")
+            return False, f"interrupted: {self.interrupted[0][1][:120]}"
         pos = self._position()
         if pos and abs(pos["x"] - x) <= 4 and abs(pos["z"] - z) <= 4:
             return True, f"arrived at {pos}"
@@ -145,6 +290,9 @@ class Actions:
         block = step["block"]  # full namespaced id — Baritone needs it for modded blocks
         self.bridge.call("chat", text=f"#goto {block}")
         ok = self._baritone_idle(timeout=step.get("timeout", 420))
+        if self.interrupted:
+            self.bridge.call("chat", text="#stop")
+            return False, f"interrupted: {self.interrupted[0][1][:120]}"
         return ok, f"pathed toward nearest {block}"
 
     def mine(self, step):
@@ -161,6 +309,8 @@ class Actions:
         ok = self._wait(enough, timeout=step.get("timeout", 600), poll=5, desc=f"mine {block}")
         self.bridge.call("chat", text="#stop")
         have = self._inventory().get(want_item, 0)
+        if self.interrupted:
+            return False, f"interrupted: {self.interrupted[0][1][:120]}"
         return have > before, f"{want_item}: {before} -> {have} (wanted {target})"
 
     def collect(self, step):
@@ -173,15 +323,17 @@ class Actions:
             return self._inventory().get(item, 0) >= count
         if enough():
             return True, "already in inventory"
-        self.bridge.call("echo", text=f"[agent] waiting for {count}x {item} in YOUR inventory — "
-                                      f"if it's a quest reward, claim it in the book")
+        self.say(f"[agent] waiting for {count}x {item} in YOUR inventory — "
+                 f"if it's a quest reward, claim it in the book")
         grace = 45 if self.body == "companion" else step.get("timeout", 180)
         if self._wait(enough, timeout=grace, poll=3, desc=f"collect {item}"):
             return True, f"{item} x{self._inventory().get(item, 0)}"
+        if self.interrupted:
+            return False, f"interrupted: {self.interrupted[0][1][:120]}"
         if self.body != "companion":
             return False, f"{item} x{self._inventory().get(item, 0)}"
         self.log(f"  collect fallback: sending the companion to mine {item}")
-        self.bridge.call("echo", text=f"[agent] not appearing — Bob will go get {item} instead")
+        self.say(f"[agent] not appearing — Bob will go get {item} instead")
         ok, note = self.agent_mine({"block": step["item"], "count": count,
                                     "timeout": step.get("timeout", 600)})
         if not ok:
@@ -233,6 +385,7 @@ class Actions:
             return False, f"{step['item']} not in inventory"
         target = step.get("at")
         if isinstance(target, dict):
+            target = self._block_pos(target)
             self.bridge.call("look_at", x=target["x"] + 0.5, y=target["y"] + 0.5, z=target["z"] + 0.5)
             time.sleep(0.3)
         else:
@@ -243,9 +396,29 @@ class Actions:
         self._tap("use")
         return True, "used"
 
+    def inspect(self, step):
+        """Report what block is at `at` (or what the bot looks at).
+
+        Eyes for the planner: verify a machine/container is really there
+        before clicking it, instead of failing blind and replanning blind.
+        """
+        target = step.get("at")
+        if isinstance(target, dict):
+            target = self._block_pos(target)
+            block = self.bridge.call("getblock", x=target["x"], y=target["y"],
+                                     z=target["z"])
+            if isinstance(block, dict):
+                block = block.get("block", block)
+            return True, (f"block at {target['x']},{target['y']},{target['z']}: "
+                          f"{block!r}")
+        tb = self.bridge.call("targeted_block") or {}
+        return True, (f"looking at: {tb.get('block', tb)!r} "
+                      f"at {tb.get('position', '?')}")
+
     def interact(self, step):
         target = step.get("at")
         if isinstance(target, dict):
+            target = self._block_pos(target)
             self.bridge.call("look_at", x=target["x"] + 0.5, y=target["y"] + 0.5, z=target["z"] + 0.5)
             time.sleep(0.3)
         else:
@@ -302,20 +475,20 @@ class Actions:
         if self._inventory().get(item, 0) >= count:
             return True, "already in inventory"
         for attempt in (1, 2):
-            self.bridge.call("echo", text=f"[agent] please CRAFT {count}x {item}, then type .done")
+            self.say(f"[agent] please CRAFT {count}x {item}, then type .done")
             self.log(f"CRAFT request: {count}x {item} (attempt {attempt})")
             if not self._wait_for_player_signal():
                 return False, f"no confirmation for crafting {item}"
             have = self._inventory().get(item, 0)
             if have >= count:
                 return True, f"crafted (verified {have} in inventory)"
-            self.bridge.call("echo", text=f"[agent] I only see {have}/{count} {item} — really crafted?")
+            self.say(f"[agent] I only see {have}/{count} {item} — really crafted?")
         return False, f"{item} still missing after 2 confirmations"
 
     def smelt(self, step):
         item, count = self._bare(step["item"]), int(step.get("count", 1))
         out = self._bare(step.get("output", step["item"]))
-        self.bridge.call("echo", text=f"[agent] please SMELT {count}x {item}, then type .done")
+        self.say(f"[agent] please SMELT {count}x {item}, then type .done")
         if not self._wait_for_player_signal():
             return False, "no confirmation for smelting"
         return True, f"smelt confirmed ({self._inventory().get(out, 0)} {out} in inventory)"
@@ -381,7 +554,7 @@ class Actions:
                     wx = int(home[0] + ring * math.cos(ang))
                     wz = int(home[2] + ring * math.sin(ang))
                     self.log(f"  agent idle — exploring toward {wx},{wz} (ring {ring})")
-                    self.bridge.call("echo", text=f"[agent] no {want} here — scouting {wx},{wz}")
+                    self.say(f"[agent] no {want} here — scouting {wx},{wz}")
                     self.bridge.call("chat", text=f"/agent run goto {wx} {int(pos[1])} {wz}")
                     leg += 1
                     if leg % 8 == 0:
@@ -457,21 +630,208 @@ class Actions:
         have = self._agent_inv(item)
         return have < before or before == 0, f"agent {item}: {before} -> {have}"
 
+    @staticmethod
+    def _split_listing(listing, own):
+        """Split a container GUI's merged slot list into (container, player).
+
+        A container screen lists the container's own slots first, then the
+        player's 36 inventory slots on top of them (measured live on a single
+        chest: 0..26 chest, player main 9..35 -> 27..53, hotbar 0..8 ->
+        54..62). So walking from the highest index down and consuming `own`
+        accounts for exactly the player's slots and leaves the container's.
+
+        Without this, taking sand while already holding some picks the
+        player's own stack, and QUICK_MOVE pushes it INTO the chest while the
+        action reports a successful pull.
+        """
+        left = {}
+        for key, val in (own or {}).items():
+            left[Actions._bare(key)] = left.get(Actions._bare(key), 0) + int(val)
+        here, mine = [], []
+        for entry in sorted(listing or [], key=lambda e: -(e.get("slot") or 0)):
+            item, count = Actions._bare(entry.get("item")), int(entry.get("count") or 1)
+            if left.get(item, 0) >= count:
+                left[item] -= count
+                mine.append(entry)
+            else:
+                here.append(entry)
+        return here, mine
+
+    @staticmethod
+    def _reach(pos, at):
+        """Rough eye-to-block distance; MC's use range is 4.5 blocks."""
+        dx = pos.get("x", 0) - at["x"]
+        dy = (pos.get("y", 0) + 1.6) - (at["y"] + 0.5)
+        dz = pos.get("z", 0) - at["z"]
+        return (dx * dx + dy * dy + dz * dz) ** 0.5
+
+    def _approach(self, at):
+        """Get within reach of `at` WITHOUT pathing onto it.
+
+        Baritone's allowBreak defaults to on, so `#goto <the container block>`
+        mines the container to stand on its own block — observed live: the test
+        chest at (10,66,7) vanished mid-action along with its contents. So skip
+        the walk when already close, and otherwise aim at an air block beside
+        the container instead.
+        """
+        pos = self._position() or {}
+        if max(abs(pos.get("x", 0) - at["x"]), abs(pos.get("z", 0) - at["z"])) <= 3:
+            return True
+        for dx, dz in ((0, 1), (1, 0), (0, -1), (-1, 0),
+                       (1, 1), (1, -1), (-1, 1), (-1, -1)):
+            x, z = at["x"] + dx, at["z"] + dz
+            block = self.bridge.call("getblock", x=x, y=at["y"], z=z) or ""
+            if self._bare(block.split("[")[0]) in ("air", "cave_air", "void_air"):
+                self.bridge.call("chat", text=f"#goto {x} {at['y']} {z}")
+                return self._baritone_idle(timeout=180)
+        self.log(f"no standable air beside {at['x']},{at['y']},{at['z']}")
+        return False
+
+    def _open_container(self, at):
+        """Aim at the container block and right-click it. None on success,
+        else a short reason string.
+
+        Reads `state` raw rather than through _state(), which closes any open
+        screen on sight — that would undo the click we just made.
+        """
+        self.bridge.call("close_screen")
+        at = self._block_pos(at)
+        self.bridge.call("look_at", x=at["x"] + 0.5, y=at["y"] + 0.5, z=at["z"] + 0.5)
+        time.sleep(0.3)
+        self._tap("use")
+        time.sleep(0.8)
+        screen = (self.bridge.call("state") or {}).get("open_screen")
+        if not screen:
+            return "nothing opened (ray missed or the block is gone)"
+        if self.bridge.call("container") is None:
+            return f"screen {screen!r} exposes no container slots"
+        return None
+
+    def _stand_ready(self, at):
+        """Walk to a container block and confirm it is within use range.
+
+        None when it can be opened, else why it cannot.
+        """
+        if not (isinstance(at, dict) and "x" in at):
+            return "no coordinates for the container"
+        if not self._approach(at):
+            return f"could not get near the container at {at['x']},{at['y']},{at['z']}"
+        reach = self._reach(self._position() or {}, at)
+        if reach > 4.5:
+            return f"still {reach:.1f}m from the container at {at['x']},{at['y']},{at['z']}"
+        return None
+
     def take_from_chest(self, step):
-        """Walk the player to a known container and have the human grab items
-        (player-body chest automation needs GUI clicks we don't have yet)."""
+        """Open a known container and QUICK_MOVE the requested items out.
+
+        `at` is the container block itself (the survey records the block the
+        player was looking at when they opened it, not their feet), so this
+        aims and clicks rather than asking the human to do it for us.
+        """
         item, count = self._bare(step["item"]), int(step.get("count", 1))
         at = step.get("at") or {}
-        before = self._inventory().get(item, 0)
-        if isinstance(at, dict) and "x" in at:
-            self.bridge.call("chat", text=f"#goto {int(at['x'])} {int(at['y'])} {int(at['z'])}")
-            self._baritone_idle(timeout=step.get("timeout", 180))
-        self.bridge.call("echo", text=f"[agent] open this chest and take {count}x {item}, "
-                                      f"then type .done")
-        if not self._wait_for_player_signal():
-            return False, f"player never confirmed taking {item}"
+        not_ready = self._stand_ready(at)
+        if not_ready:
+            return False, not_ready
+
+        before = self._inventory().get(item, 0)   # _state() dismisses any stray GUI
+        blocked = self._open_container(at)
+        if blocked:
+            self.bridge.call("close_screen")
+            return False, (f"cannot open the container at "
+                           f"{at['x']},{at['y']},{at['z']}: {blocked}")
+
+        wanted, pulled = count, 0
+        while pulled < wanted:
+            listing = self.bridge.call("container") or []
+            own = (self.bridge.call("state") or {}).get("inventory", {})
+            container, _ = self._split_listing(listing, own)
+            candidates = [e for e in container
+                          if self._bare(e["item"]) == item and e.get("slot") is not None]
+            if not candidates:
+                break
+            # _split_listing hands back slots descending, so next() would grab
+            # the small stack first and then need the big one too — asking for
+            # 64 from a chest holding 16+64 pulled all 80. Take the biggest
+            # stack that still fits the remainder; if none fits, the smallest
+            # one, which is the least over-pull a whole-stack click can do.
+            fits = [e for e in candidates if int(e.get("count") or 1) <= wanted - pulled]
+            entry = (max(fits, key=lambda e: int(e.get("count") or 1)) if fits
+                     else min(candidates, key=lambda e: int(e.get("count") or 1)))
+            res = self.bridge.call("container_click", slot=entry["slot"], button=0,
+                                   click_type="QUICK_MOVE") or {}
+            if not res.get("ok"):
+                self.bridge.call("close_screen")
+                return False, f"container_click failed: {res.get('reason')}"
+            pulled += int(entry.get("count") or 1)
+            time.sleep(0.3)
+        self.bridge.call("close_screen")
+        time.sleep(0.5)
+
         have = self._inventory().get(item, 0)
-        return have >= min(before + count, count), f"player {item}: {before} -> {have}"
+        moved = have - before
+        if moved <= 0:
+            return False, f"{item} not in that container"
+        if moved < count:
+            return False, f"only pulled {moved}/{count} {item}: {before} -> {have}"
+        return True, f"took {moved} {item}: {before} -> {have}"
+
+    def put_in_chest(self, step):
+        """Open a known container and QUICK_MOVE the player's own stacks into it.
+
+        The deposit half of take_from_chest: same reach/approach/open/close
+        discipline, but the click lands on the player's half of the slot list
+        (27..62), where vanilla's QUICK_MOVE routes the stack into the
+        container. A whole stack moves per click, so asking for 16 can push
+        64 — the note reports what actually moved.
+        """
+        item, count = self._bare(step["item"]), int(step.get("count", 1))
+        at = step.get("at") or {}
+        not_ready = self._stand_ready(at)
+        if not_ready:
+            return False, not_ready
+
+        before = self._inventory().get(item, 0)
+        if before <= 0:
+            return False, f"player has no {item} to deposit"
+        blocked = self._open_container(at)
+        if blocked:
+            self.bridge.call("close_screen")
+            return False, (f"cannot open the container at "
+                           f"{at['x']},{at['y']},{at['z']}: {blocked}")
+
+        wanted, pushed = count, 0
+        while pushed < wanted:
+            listing = self.bridge.call("container") or []
+            own = (self.bridge.call("state") or {}).get("inventory", {})
+            _, mine = self._split_listing(listing, own)
+            candidates = [e for e in mine
+                          if self._bare(e["item"]) == item and e.get("slot") is not None]
+            if not candidates:
+                break
+            # same rule as take: the biggest stack that still fits the
+            # remainder, else the smallest one (least over-pull a whole-stack
+            # click can do).
+            fits = [e for e in candidates if int(e.get("count") or 1) <= wanted - pushed]
+            entry = (max(fits, key=lambda e: int(e.get("count") or 1)) if fits
+                     else min(candidates, key=lambda e: int(e.get("count") or 1)))
+            res = self.bridge.call("container_click", slot=entry["slot"], button=0,
+                                   click_type="QUICK_MOVE") or {}
+            if not res.get("ok"):
+                self.bridge.call("close_screen")
+                return False, f"container_click failed: {res.get('reason')}"
+            pushed += int(entry.get("count") or 1)
+            time.sleep(0.3)
+        self.bridge.call("close_screen")
+        time.sleep(0.5)
+
+        have = self._inventory().get(item, 0)
+        moved = before - have
+        if moved <= 0:
+            return False, f"nothing moved — is that container full of {item}?"
+        if moved < count:
+            return False, f"only pushed {moved}/{count} {item}: {before} -> {have}"
+        return True, f"deposited {moved} {item}: {before} -> {have}"
 
     def wait_for(self, step):
         seconds = step.get("seconds", 30)
@@ -485,7 +845,7 @@ class Actions:
 
     def manual(self, step):
         reason = step.get("reason", "unsupported action")
-        self.bridge.call("echo", text=f"[agent] NEED HELP: {reason} — do it, then type .done in chat")
+        self.say(f"[agent] NEED HELP: {reason} — do it, then type .done in chat")
         self.log(f"MANUAL ESCALATION: {reason}")
         if not self._wait_for_player_signal():
             return False, "player never confirmed manual step"
@@ -541,7 +901,7 @@ class Actions:
         ok, note = handler(action)
         health_after = (self.bridge.call("state") or {}).get("health")
         if health_before and health_after and health_after < min(6, health_before - 8):
-            self.bridge.call("echo", text="[agent] taking heavy damage — pausing, type .done when safe")
+            self.say("[agent] taking heavy damage — pausing, type .done when safe")
             self.log(f"DANGER: health {health_before} -> {health_after}")
             self._wait_for_player_signal(timeout=300)
         return ok, note

@@ -22,6 +22,11 @@ HOST, PORT = "127.0.0.1", 48750
 CHAT_LOG = deque(maxlen=500)
 CHAT_SEQ = {"n": 0}
 
+# net.minecraft.world.inventory.ClickType constants — enum names are not
+# obfuscated, but an unvalidated name would be handed straight to a static
+# field read, so container_click only accepts these.
+CLICK_TYPES = {"PICKUP", "PICKUP_ALL", "QUICK_MOVE", "SWAP", "CLONE", "THROW", "QUICK_CRAFT"}
+
 
 def _fn(name):
     return getattr(minescript, name, None)
@@ -39,7 +44,7 @@ def op_probe(_req):
               "player_press_forward", "player_press_use", "player_press_attack",
               "player_press_sneak", "player_press_jump",
               "player_inventory_select_slot", "player_inventory_slot_to_hotbar",
-              "entities", "player_get_targeted_block", "container_click_slot",
+              "entities", "player_get_targeted_block",
               "container_get_items", "screen_name", "EventQueue"]
     return {name: bool(_fn(name)) for name in wanted}
 
@@ -123,7 +128,11 @@ def op_getblock(req):
 
 
 def op_container(_req):
-    """Items in the currently open container GUI (None if nothing open)."""
+    """Items in the currently open container GUI (None if nothing open).
+
+    Forwards `slot` too: container_click addresses slots by index, so a
+    listing without addresses is unreadable for writing.
+    """
     fn = _fn("container_get_items")
     if not fn:
         return None
@@ -132,9 +141,13 @@ def op_container(_req):
         return None
     out = []
     for stack in items:
+        get = (lambda k: stack.get(k)) if isinstance(stack, dict) else (lambda k: getattr(stack, k, None))
         item_id, count = _item_entry(stack)
         if item_id:
-            out.append({"item": item_id, "count": int(count)})
+            entry = {"item": item_id, "count": int(count)}
+            if get("slot") is not None:
+                entry["slot"] = int(get("slot"))
+            out.append(entry)
     return out
 
 
@@ -214,8 +227,100 @@ def op_targeted_block(req):
 
 
 def op_container_click(req):
-    fn = _fn("container_click_slot")
-    return fn(int(req["slot"])) if fn else None
+    """Click one slot of the currently open container GUI, in-process.
+
+    This is the container *write* primitive. minescript ships no
+    container_click_slot (absent from minescript-forge-1.20.1-4.0.jar), which
+    is why the old op forwarded to a function that does not exist and quietly
+    returned null — and why `--body player` agent_take/agent_store could never
+    move an item.
+
+    The click must go through vanilla's own path:
+
+        AbstractContainerScreen.slotClicked
+          -> MultiPlayerGameMode.handleInventoryMouseClick(
+                 containerId, slot, button, ClickType, player)   m_171799_
+
+    because that method both calls AbstractContainerMenu.clicked (m_150399_)
+    AND sends ServerboundContainerClickPacket. Calling m_150399_ directly —
+    what this op did first — mutates the client menu only: the GUI shows the
+    transfer while open, then the next container resync snaps every item back.
+    Observed live: deposit two stacks, close, and `data get block 10 66 7`
+    reports `Items: []` with all of it restored to the player.
+
+    SRG names verified by javap against forge-1.20.1-47.4.16-client.jar plus
+    the mcp_config tsrg2 (obf -> srg) mappings, cross-checked against the
+    bytecode of evp.a(ccx,I,I,cbo) [AbstractContainerScreen.slotClicked]:
+        Minecraft.getInstance       m_91087_
+        Minecraft.gameMode          f_91072_   (field enn.r:Lffa;)
+        Minecraft.player            f_91074_
+        Player.containerMenu        f_36096_
+        AbstractContainerMenu.containerId  f_38840_  (field cbf.j:I)
+        MultiPlayerGameMode.handleInventoryMouseClick  m_171799_
+        ClickType.PICKUP            PICKUP     (enum constants keep names)
+
+    Field reads come back as object-table handles (java_access_field returns
+    job.objects.retain(value)), so an int field is unboxed with java_to_string
+    before it can be sent as a container id.
+
+    Args: slot (menu index), button (default 0), click_type (default PICKUP).
+      click_type PICKUP: pick up / put down the carried stack.
+      QUICK_MOVE: shift-click (whole stack, routing both directions).
+      SWAP: exchange with hotbar `button` (0-8) — the clean way to stage a
+            single stack into hotbar then into a container slot.
+
+    In-process rather than simulated mouse: OS-level clicks would have to
+    focus the bot's window, and focus is exactly what the human must not lose.
+    """
+    cls_fn, member_fn, call_fn = _fn("java_class"), _fn("java_member"), _fn("java_call_method")
+    field_fn, int_fn, str_fn = _fn("java_access_field"), _fn("java_int"), _fn("java_to_string")
+    if not all((cls_fn, member_fn, call_fn, field_fn, int_fn, str_fn)):
+        return {"ok": False, "reason": "java interop unavailable"}
+
+    click_type = str(req.get("click_type") or "PICKUP").upper()
+    if click_type not in CLICK_TYPES:
+        return {"ok": False, "reason": f"unknown click_type {click_type!r}"}
+    # A containerMenu handle is never null (the player always has the
+    # InventoryMenu), so without this guard "click the chest" would silently
+    # rearrange the player's own inventory instead of failing.
+    if not _fn("screen_name")():
+        return {"ok": False, "reason": "no container open"}
+
+    try:
+        slot, button = int(req["slot"]), int(req.get("button", 0))
+    except (KeyError, TypeError, ValueError) as exc:
+        return {"ok": False, "reason": f"bad args: {exc}"}
+
+    mc_cls = cls_fn("net.minecraft.client.Minecraft")
+    menu_cls = cls_fn("net.minecraft.world.inventory.AbstractContainerMenu")
+    label = "Minecraft.getInstance"
+    try:
+        mc = call_fn(mc_cls, member_fn(mc_cls, "m_91087_"))
+        label = "Minecraft.player"
+        player = field_fn(mc, member_fn(mc_cls, "f_91074_"))
+        label = "Minecraft.gameMode"
+        game_mode = field_fn(mc, member_fn(mc_cls, "f_91072_"))
+        label = "Player.containerMenu"
+        menu = field_fn(player, member_fn(cls_fn("net.minecraft.world.entity.player.Player"),
+                                          "f_36096_"))
+        # handleInventoryMouseClick drops the click on the floor unless the
+        # containerId matches the menu the player actually has open. Every
+        # java_* result is job.objects.retain(value) — an object-table id —
+        # so the int read back here is a handle, not the id: feeding it
+        # straight in made vanilla log "Ignoring click in mismatching
+        # container. Click in 13, player has 1" and move nothing.
+        label = "AbstractContainerMenu.containerId"
+        container_id = int(str_fn(field_fn(menu, member_fn(menu_cls, "f_38840_"))))
+        label = f"ClickType.{click_type}"
+        ct_cls = cls_fn("net.minecraft.world.inventory.ClickType")
+        click = field_fn(ct_cls, member_fn(ct_cls, click_type))
+        label = f"handleInventoryMouseClick(slot={slot}, button={button}, {click_type})"
+        gm_cls = cls_fn("net.minecraft.client.multiplayer.MultiPlayerGameMode")
+        call_fn(game_mode, member_fn(gm_cls, "m_171799_"),
+                int_fn(container_id), int_fn(slot), int_fn(button), click, player)
+    except Exception as exc:
+        return {"ok": False, "reason": f"{label}: {type(exc).__name__}: {exc}"}
+    return {"ok": True, "slot": slot, "button": button, "click_type": click_type}
 
 
 def op_screenshot(_req):
@@ -284,13 +389,109 @@ def op_close_screen(_req):
     return {"closed": True}
 
 
+def op_interop_probe(_req):
+    """Walk the container-click interop chain and report where it breaks.
+
+    Container *writing* needs
+    `AbstractContainerMenu.m_150399_(slot, button, ClickType, player)`, which
+    in turn needs live handles for `Minecraft.player` and
+    `Player.containerMenu`. Both are OBJECT fields, and op_close_screen's
+    docstring records that minescript's java_access_field hands back a truthy
+    null-ish handle for those. Nothing else in this bridge reads an object
+    field, so the whole container feature rests on one unverified assumption.
+
+    This op is the experiment, so it must report per-step (the break point is
+    the answer), must never raise out of a bad handle (that is the failure we
+    are hunting), and must never mutate: no clicked(), no setScreen().
+
+    SRG names come from javap against forge-1.20.1-47.4.16-client.jar and the
+    mcp_config tsrg2 mappings, not from memory:
+        Minecraft.getInstance          m_91087_
+        Minecraft.player               f_91074_
+        Player.containerMenu           f_36096_
+        AbstractContainerMenu.getType  m_6772_
+        AbstractContainerMenu.clicked  m_150399_   (probed for later, not called)
+        ClickType.PICKUP               PICKUP      (enum constants keep names)
+    """
+    names = ("java_class", "java_member", "java_call_method",
+             "java_access_field", "java_to_string")
+    have = {n: bool(_fn(n)) for n in names}
+    if not all(have.values()):
+        return {"ok": False, "missing": [n for n, v in have.items() if not v],
+                "steps": []}
+
+    cls_fn, member_fn = _fn("java_class"), _fn("java_member")
+    call_fn, field_fn = _fn("java_call_method"), _fn("java_access_field")
+    to_str = _fn("java_to_string")
+
+    steps = []
+    memo = {}
+
+    def klass(name):
+        if name not in memo:
+            memo[name] = cls_fn(name)
+        return memo[name]
+
+    def describe(handle):
+        """Return (live_handle, detail); a null-in-Java handle is not live."""
+        if handle is None:
+            return None, "returned null"
+        try:
+            text = str(to_str(handle))
+        except Exception as exc:
+            return None, f"{type(exc).__name__}: {exc}"
+        if not text or text == "null":
+            return None, f"toString -> {text!r}"
+        return handle, text
+
+    def run(name, fn):
+        try:
+            handle = fn()
+        except Exception as exc:
+            steps.append({"name": name, "ok": False,
+                          "detail": f"{type(exc).__name__}: {exc}"})
+            return None
+        handle, detail = describe(handle)
+        steps.append({"name": name, "ok": handle is not None, "detail": detail})
+        return handle
+
+    MC = "net.minecraft.client.Minecraft"
+    PLAYER = "net.minecraft.world.entity.player.Player"
+    MENU = "net.minecraft.world.inventory.AbstractContainerMenu"
+
+    mc = run("Minecraft.getInstance",
+             lambda: call_fn(klass(MC), member_fn(klass(MC), "m_91087_")))
+    if mc is None:
+        return {"ok": False, "steps": steps}
+
+    player = run("Minecraft.player",
+                 lambda: field_fn(mc, member_fn(klass(MC), "f_91074_")))
+    if player is None:
+        return {"ok": False, "steps": steps}
+
+    menu = run("Player.containerMenu",
+               lambda: field_fn(player, member_fn(klass(PLAYER), "f_36096_")))
+    if menu is None:
+        return {"ok": False, "steps": steps}
+
+    run("AbstractContainerMenu.getType",
+        lambda: call_fn(menu, member_fn(klass(MENU), "m_6772_")))
+    run("ClickType.PICKUP",
+        lambda: field_fn(klass("net.minecraft.world.inventory.ClickType"),
+                         member_fn(klass("net.minecraft.world.inventory.ClickType"),
+                                   "PICKUP")))
+
+    return {"ok": all(s["ok"] for s in steps) and len(steps) == 5,
+            "steps": steps}
+
+
 OPS = {"probe": op_probe, "state": op_state, "chat": op_chat, "echo": op_echo,
        "chat_log": op_chat_log, "getblock": op_getblock, "container": op_container,
        "look_at": op_look_at, "press": op_press, "inventory_slots": op_inventory_slots,
        "select_slot": op_select_slot, "slot_to_hotbar": op_slot_to_hotbar,
        "hand": op_hand, "entities": op_entities, "targeted_block": op_targeted_block,
        "container_click": op_container_click, "screenshot": op_screenshot,
-       "close_screen": op_close_screen}
+       "close_screen": op_close_screen, "interop_probe": op_interop_probe}
 
 
 def chat_listener():

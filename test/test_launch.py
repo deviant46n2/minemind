@@ -40,6 +40,31 @@ def test_join_game_args() -> None:
     out = run("--join", "127.0.0.1:37875")
     assert "param --quickPlayMultiplayer\nparam 127.0.0.1:37875\n" in out + "\n", \
         "quickPlay join arg missing from stdin params"
+    # each quick-play flag is gated by its OWN feature rule, so an absent
+    # --quickPlaySingleplayer (not a "-" placeholder) is what disables it
+    assert "quickPlaySingleplayer" not in out, \
+        "singleplayer must stay disabled when --join is used"
+
+
+def test_singleplayer_game_args() -> None:
+    """The bot must be able to open one of its OWN saves without a human host.
+
+    This is the autonomous test bed: probes against a real world no longer
+    depend on the human launching their client first.
+    """
+    out = run("--singleplayer", "nis")
+    assert "param --quickPlaySingleplayer\nparam nis\n" in out + "\n", \
+        "quickPlaySingleplayer arg missing from stdin params"
+    assert "quickPlayMultiplayer" not in out, \
+        "multiplayer must stay disabled when --singleplayer is used"
+
+
+def test_join_and_singleplayer_conflict() -> None:
+    """Both quick-play flags at once is ambiguous — MC would pick one silently."""
+    r = subprocess.run([sys.executable, str(LAUNCH), "--dry-run",
+                        "--join", "127.0.0.1:25565", "--singleplayer", "nis"],
+                       capture_output=True, text=True, timeout=60)
+    assert r.returncode != 0, "mutually exclusive flags must be rejected"
 
 
 def main() -> None:
@@ -47,6 +72,10 @@ def main() -> None:
     print("ok  test_entrypoint_protocol")
     test_join_game_args()
     print("ok  test_join_game_args")
+    test_singleplayer_game_args()
+    print("ok  test_singleplayer_game_args")
+    test_join_and_singleplayer_conflict()
+    print("ok  test_join_and_singleplayer_conflict")
     print("PASS")
 
 

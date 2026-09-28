@@ -164,13 +164,16 @@ def build() -> tuple[list, dict]:
         "${resolution_width}": "1280",
         "${resolution_height}": "720",
         "${quickPlayMultiplayer}": ARGS.join or "-",
-        "${quickPlaySingleplayer}": "-",
+        "${quickPlaySingleplayer}": ARGS.singleplayer or "-",
         "${quickPlayDemo}": "-",
         "${demo_user_name}": "-",
     }
     if ARGS.join:
         FEATURES.update({"has_quick_play_support": True,
                          "is_quick_play_multiplayer": True})
+    if ARGS.singleplayer:
+        FEATURES.update({"has_quick_play_support": True,
+                         "is_quick_play_singleplayer": True})
 
     game = substitute(parent.get("arguments", {}).get("game", []), subs)
     game += substitute(child.get("arguments", {}).get("game", []), subs)
@@ -381,7 +384,12 @@ def main() -> None:
     ap.add_argument("--username", default=USERNAME)
     ap.add_argument("--uuid", default="00000000-0000-0000-0000-0000c00b07b0")
     ap.add_argument("--heap", default="4G")
-    ap.add_argument("--join", default=None, help="auto-join host:port (LAN world)")
+    target = ap.add_mutually_exclusive_group()
+    target.add_argument("--join", default=None,
+                        help="auto-join host:port (LAN world)")
+    target.add_argument("--singleplayer", default=None, metavar="WORLD",
+                        help="open WORLD from the bot's own saves/ instead of "
+                             "joining — the autonomous test bed, no human host needed")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--wait", action="store_true", help="poll log until in-game")
     ap.add_argument("--shot", default=None, help="take grim screenshot into data/proof/")

@@ -72,10 +72,13 @@ implements these and nothing else):
 - {"action": "place", "item": "mod:block_id", "at": {"x":..,"y":..,"z":..}}     # give coords near the player when possible; "where": "description" falls back to asking the human
 - {"action": "use_item_on", "item": "mod:item_id", "target": "mod:block_id", "at": {"x":..,"y":..,"z":..}}  # "at" optional if already looking at the target
 - {"action": "interact", "block": "mod:block_id", "gui": true|false, "at": {"x":..,"y":..,"z":..}}  # right-click; gui:true verifies a screen opened
-- {"action": "take_from_chest", "item": "mod:item_id", "count": N, "at": {"x":..,"y":..,"z":..}}  # walk the player to a KNOWN container (state.base.containers positions!) and grab items with a quick .done
+- {"action": "take_from_chest", "item": "mod:item_id", "count": N, "at": {"x":..,"y":..,"z":..}}  # walk to a KNOWN container ("at" is its block position) — the bot opens it and clicks the items over itself
+- {"action": "put_in_chest", "item": "mod:item_id", "count": N, "at": {"x":..,"y":..,"z":..}}  # the reverse: the bot walks to a KNOWN container and drops its own stacks in (whole stacks only, so it may deposit more than N — the note says what actually moved)
 - {"action": "wait_for", "condition": "short description"}           # crop growth, machine done, night, ...
 - {"action": "quest_checkmark", "quest_id": "HEX"}                   # checkmark tasks: /ftbquests change progress (equivalent to clicking the book)
 - {"action": "manual", "reason": "why automation can't do this yet"} # escalate to human
+- {"action": "ask", "question": "what you need to know"}             # ask the PLAYER in chat; their reply completes the step — use this instead of guessing whenever a step depends on something unknowable (a location, which machine, a yes/no)
+- {"action": "inspect", "at": {"x":..,"y":..,"z":..}}               # report the block id at coordinates ("at" optional — without it, reports what you are looking at). Use this to VERIFY a machine/container is really there before clicking it
 """
 
 _WORLD_FACTS = """\
@@ -135,6 +138,64 @@ def get_system(body="companion"):
 
 # backward compatibility (companion is the default mode)
 PLANNER_SYSTEM = get_system("companion")
+
+
+_CHORE_RULES = """\
+Rules for chore work (the player talks, you do — nothing else is your job):
+- The PLAYER's words are the whole task. There is no quest book, no frontier,
+  no autonomous agenda: NEVER pursue quests, gather "while you're at it", or
+  add steps the player didn't ask for. If they mention a quest, treat it as
+  a chore like any other (a quest_checkmark step only when they asked for it).
+- When anything a step needs is unknowable from the state below — a location,
+  which of several machines, a yes/no, an item you can't see — emit an "ask"
+  step INSTEAD of guessing. Guessing a location and marching off is a planning
+  failure. One question per step; keep questions short and concrete.
+- "at" coordinates must come from the player, state.base, or a survey — never
+  invent them. take_from_chest/put_in_chest need the container's block
+  position; goto needs a real destination. Floor them to integers: a player
+  "standing on" or "at" a block means the block BELOW their feet (feet_y - 1).
+  When unsure what is really at a coordinate, "inspect" it first — clicking
+  blind, failing, and replanning the same click is a planning failure.
+- CHECK STORAGE FIRST, same as ever: state.base.storage_totals/containers
+  before gathering or asking the human to fetch anything.
+- When the player names an item or block you cannot see in the state and that
+  is not in state.base: ASK where it is (which chest, which place) instead of
+  marching to the nearest terrain match. Mining the landscape for something
+  sitting in a chest is a planning failure.
+- Crafting/smelting still require the HUMAN's hands: craft/smelt steps become
+  verified requests the player confirms with .done in chat. Batch them.
+- Output schema:
+{
+  "steps": [{"n": 1, "action": {...}, "notes": "..."}],
+  "risks": ["..."]
+}
+Emit a plan with steps even when the first step is "ask" — the reply arrives
+as the next turn's conversation, and you continue from there. JSON only."""
+
+
+def get_chore_system(body="player"):
+    """Planner system prompt for conversation-driven chore work."""
+    body_block = _PLAYER_BODY if body == "player" else _COMPANION_BODY
+    return (_HEADER + "\n" + body_block + "\n" + _SHARED_ACTIONS + "\n"
+            + _WORLD_FACTS + "\n" + _CHORE_RULES)
+
+
+def build_chore_prompt(instruction, history, state):
+    """instruction: the player's latest words. history: [(speaker, text)]
+    oldest-first, "player" or "bot". state: live game state (no quests)."""
+    import json as _json
+    convo = "\n".join(f"{'Player' if s == 'player' else 'You'}: {t}"
+                      for s, t in (history or []))
+    return f"""Current game state:
+{_json.dumps(state, indent=1)}
+
+Recent conversation:
+{convo if convo else "(none — this is the first thing the player has said)"}
+
+Player's instruction:
+{instruction}
+
+Do what they asked, in order, with the action vocabulary. JSON only."""
 
 
 def build_planner_prompt(chapter_summary, frontier_quests, state, max_quests=10):

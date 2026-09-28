@@ -19,7 +19,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import state as state_mod
 import world_state
-from actions import Actions
+from actions import Actions, extract_player_lines
 
 ROOT = Path(__file__).resolve().parent.parent
 HOST, PORT = "127.0.0.1", 48750
@@ -47,6 +47,13 @@ def log(msg):
     print(line, flush=True)
     with open(LOG_PATH, "a", encoding="utf-8") as f:
         f.write(json.dumps({"t": time.time(), "msg": msg}) + "\n")
+
+
+def say(bridge, text):
+    """User-visible message, broadcast through world chat — `echo` only
+    shows on the bot's own screen, invisible to the human host on a LAN
+    join. Never pass /commands here; use the `chat` op directly."""
+    bridge.call("chat", text=text)
 
 
 class BridgeClient:
@@ -110,7 +117,7 @@ def load_base_summary():
     for c in (base.get("containers") or {}).values():
         for item, count in c.get("items", {}).items():
             totals[item] = totals.get(item, 0) + count
-        pos = c.get("position") or {}
+        pos = c.get("at") or c.get("position") or {}
         top_items = dict(sorted(c.get("items", {}).items(), key=lambda kv: -kv[1])[:10])
         containers.append({"at": {"x": int(pos.get("x", 0)), "y": int(pos.get("y", 0)),
                                   "z": int(pos.get("z", 0))},
@@ -143,7 +150,7 @@ def survey(bridge):
         else {"notes": [], "containers": {}}
     containers = base.setdefault("containers", {})
     log("SURVEY: walk your base and open every chest/machine; type .done in chat to finish")
-    bridge.call("echo", text="[agent] survey mode — open chests/machines one by one, type .done when finished")
+    say(bridge, "[agent] survey mode — open chests/machines one by one, type .done when finished")
     first = bridge.call("chat_log", since=0)
     since = first["latest"] if first else 0
     last_screen = None
@@ -163,6 +170,13 @@ def survey(bridge):
                 log(f"  no container items readable on screen {screen!r}")
             if items:
                 pos = live.get("position", {})
+                # take_from_chest has to aim at and right-click this block, so
+                # record what the player was LOOKING at when they opened it.
+                # Their feet position (still stored as "position" for old
+                # surveys) is only a rendezvous point, not the container.
+                block = (bridge.call("targeted_block") or {}).get("position") or []
+                at = {"x": int(block[0]), "y": int(block[1]), "z": int(block[2])} \
+                    if len(block) == 3 else dict(pos)
                 # container GUIs include the player's own inventory — subtract it
                 agg = {}
                 for it in items:
@@ -173,7 +187,7 @@ def survey(bridge):
                         agg[bare] = max(0, agg[bare] - count)
                 agg = {k: v for k, v in agg.items() if v > 0}
                 key = f"{round(pos.get('x', 0))},{round(pos.get('y', 0))},{round(pos.get('z', 0))}"
-                entry = {"screen": screen, "position": pos, "items": agg}
+                entry = {"screen": screen, "position": pos, "at": at, "items": agg}
                 existing = containers.get(key)
                 # a too-early read can see only the (subtracted) player inv -> {};
                 # never replace a known-good entry with an emptier one
@@ -182,7 +196,7 @@ def survey(bridge):
                 if containers.get(key) != entry:
                     containers[key] = entry
                     log(f"recorded '{screen}' @ {key}: {len(agg)} item types")
-                    bridge.call("echo", text=f"[agent] recorded ({len(agg)} item types) — next one")
+                    say(bridge, f"[agent] recorded ({len(agg)} item types) — next one")
         last_screen = screen
         logs = bridge.call("chat_log", since=since)
         if logs:
@@ -194,24 +208,51 @@ def survey(bridge):
     BASE_PATH.write_text(json.dumps(base, indent=1), encoding="utf-8")
     total_types = len({i for c in containers.values() for i in c["items"]})
     log(f"survey saved: {len(containers)} containers, {total_types} distinct item types -> {BASE_PATH}")
-    bridge.call("echo", text=f"[agent] survey done: {len(containers)} containers recorded")
+    say(bridge, f"[agent] survey done: {len(containers)} containers recorded")
 
 
 def run_plan(bridge, world, plan, actions, mark_complete=None):
+    """Execute plan steps. Returns (steps_done, failed_step_or_None, notes).
+
+    notes holds one {n, action, ok, note} per executed step — the caller
+    feeds them back into the next plan so a failure informs the replan
+    instead of repeating it.
+    """
     completed_steps = 0
     failed_quests = set()
-    for step in plan.get("steps", []):
+    notes = []
+    for raw in plan.get("steps", []):
+        # the local model sometimes puts params beside the action
+        # ({"n":1, "action":"take_from_chest", "item":"sand"}) instead of
+        # inside it — normalize rather than die; skip what isn't a step
+        if not isinstance(raw, dict):
+            return completed_steps, {"n": "?", "action": {"action": "skip"},
+                                     "notes": f"not a step: {str(raw)[:120]}"}, notes
+        step = raw
+        action = step.get("action")
+        if isinstance(action, str):
+            lifted = {k: v for k, v in step.items()
+                      if k not in ("n", "action", "notes", "for_quest")}
+            step = dict(step, action={"action": action, **lifted})
+            log(f"  (normalized string action '{action}' with {sorted(lifted)})")
+        if not isinstance(step.get("action"), dict):
+            return completed_steps, {"n": step.get("n", "?"),
+                                     "action": {"action": "skip"},
+                                     "notes": f"no action: {str(raw)[:120]}"}, notes
         desc = f"step {step.get('n')}: {step['action'].get('action')} {json.dumps(step['action'])[:100]}"
         log(desc)
         ok, note = actions.run(step)
         log(f"  -> {'OK' if ok else 'FAIL'}: {note}")
-        if not ok:
+        if (not ok and step.get("action", {}).get("action") != "ask"
+                and not getattr(actions, "interrupted", None)):
             log("  retrying once...")
             ok, note = actions.run(step)
             log(f"  -> {'OK' if ok else 'FAIL'}: {note}")
+        notes.append({"n": step.get("n"), "action": step["action"].get("action"),
+                      "ok": ok, "note": note})
         if not ok:
             failed_quests.add(step.get("for_quest"))
-            return completed_steps, step
+            return completed_steps, step, notes
         completed_steps += 1
     # item quests complete automatically once items are held, but the save file
     # lags (autosave) — record fully-executed targets so the frontier advances
@@ -219,7 +260,79 @@ def run_plan(bridge, world, plan, actions, mark_complete=None):
         for target in plan.get("target_quests", []):
             if target["id"] not in failed_quests:
                 mark_complete(target["id"])
-    return completed_steps, None
+    return completed_steps, None, notes
+
+
+def run_chores(bridge, actions, args, world):
+    """Conversation-driven loop: the player talks, the bot does chores.
+
+    Every chat line FROM the player is an instruction. Each turn plans from
+    their words + recent conversation + live state (no quests anywhere).
+    An `ask` step questions the player mid-plan; their reply arrives as the
+    next turn's conversation. Silence between turns just waits — idle polls
+    never consume a cycle.
+    """
+    import llm
+    import planner
+    import prompts
+    from collections import deque
+    history = deque(maxlen=10)  # (speaker, text), oldest first
+    first = bridge.call("chat_log", since=0)
+    chat_seen = first["latest"] if first else 0
+    say(bridge, f"[agent] online ({args.body} mode) — tell me what to do, "
+                f"ask me anything, I'll ask when I'm unsure")
+    turns = 0
+    while turns < args.max_cycles:
+        logs = bridge.call("chat_log", since=chat_seen) or {}
+        chat_seen = logs.get("latest", chat_seen)
+        lines = extract_player_lines(logs.get("entries", []), args.player_name)
+        if not lines:
+            time.sleep(5)
+            continue
+        texts = []
+        for _, text in lines:
+            history.append(("player", text))
+            low = text.lower()
+            if low.startswith(".goal"):  # legacy steering still works
+                rest = text[5:].strip()
+                texts.append(rest if rest.lower() != "clear" else "")
+            else:
+                texts.append(text)
+        instruction = "\n".join(t for t in texts if t).strip()
+        if not instruction:
+            continue
+        game_state = build_game_state(bridge, world, set())
+        prompt = prompts.build_chore_prompt(instruction, list(history),
+                                            game_state)
+        log(f"chore turn {turns + 1}: {instruction[:120]} "
+            f"(planning via {llm.provider()})")
+        plan = None
+        for attempt in range(3):
+            try:
+                plan = planner.extract_json(
+                    llm.complete(prompts.get_chore_system(args.body), prompt))
+                break
+            except Exception as exc:
+                log(f"planning attempt {attempt + 1} failed: {exc}")
+                time.sleep(10)
+        if plan is None:
+            say(bridge, "[agent] planner unavailable, will retry")
+            time.sleep(60)
+            continue
+        steps = plan.get("steps", [])
+        log(f"plan: {len(steps)} steps")
+        actions.chat_seen = chat_seen  # waits only react to newer lines
+        done, failed, step_notes = run_plan(bridge, world, plan, actions, None)
+        if failed:
+            last = step_notes[-1] if step_notes else {}
+            summary = (f"did {done}, stuck at step {failed.get('n')}: "
+                       f"{last.get('note', '')} — tell me how to proceed")
+        else:
+            summary = f"done ({done} step{'s' if done != 1 else ''})"
+        history.append(("bot", summary))
+        say(bridge, f"[agent] {summary}")
+        turns += 1
+    say(bridge, "[agent] session over — start me again when you need me")
 
 
 def main():
@@ -240,6 +353,16 @@ def main():
                          "mods); player = the AI drives YOUR character (client-side only, "
                          "works on any server)")
     ap.add_argument("--max-cycles", type=int, default=10)
+    ap.add_argument("--mode", default="chores", choices=["chores", "quests"],
+                    help="chores = do what the player says in chat, ask when "
+                         "unsure, never quest (default); quests = autonomous "
+                         "FTB quest frontier loop")
+    ap.add_argument("--player-name", default=os.environ.get("RECLAMATION_PLAYER",
+                                                            "Deviant46n2"),
+                    help="whose chat lines count as instructions")
+    ap.add_argument("--op", help="one-shot: run a single bridge op and print its "
+                                 "result, then exit (e.g. --op interop_probe)")
+    ap.add_argument("--op-args", default="{}", help="JSON object of arguments for --op")
     args = ap.parse_args()
 
     global BASE_PATH
@@ -247,6 +370,11 @@ def main():
         ROOT / "data" / ("base_mp.json" if args.mp else "base_sp.json")
 
     bridge = wait_for_bridge()
+    if args.op:
+        # deliberately before close_screen below: a one-shot `container` read
+        # would be defeated by closing the GUI it is reading
+        print(json.dumps(bridge.call(args.op, **json.loads(args.op_args)), indent=1))
+        return
     caps = bridge.call("probe")
     missing = [k for k, v in (caps or {}).items() if not v]
     log(f"bridge capabilities OK; missing: {missing or 'none'}")
@@ -283,9 +411,9 @@ def main():
     log(f"{len(completed)} quests already complete")
 
     actions = Actions(bridge, get_completed, log, mp=args.mp, mark_complete=mark_complete,
-                      body=args.body)
+                      body=args.body, player_name=args.player_name)
     log(f"body mode: {args.body}")
-    bridge.call("echo", text=f"[agent] online ({args.body} mode) — starting work")
+    say(bridge, f"[agent] online ({args.body} mode) — starting work")
 
     if args.body == "companion":
         # make sure a PlayerEngine companion exists in THIS world
@@ -299,8 +427,12 @@ def main():
 
     if args.plan:
         plan = json.loads(Path(args.plan).read_text(encoding="utf-8"))
-        done, failed = run_plan(bridge, world, plan, actions, mark_complete)
+        done, failed, _notes = run_plan(bridge, world, plan, actions, mark_complete)
         log(f"fixed plan finished: {done} steps done, failed at: {failed and failed.get('n')}")
+        return
+
+    if args.mode == "chores":
+        run_chores(bridge, actions, args, world)
         return
 
     # LLM planning loop
@@ -351,10 +483,10 @@ def main():
             text = msg.lower().split(".goal", 1)[1].strip()
             if text == "clear":
                 directive["text"] = None
-                bridge.call("echo", text="[agent] directive cleared — back to autonomous questing")
+                say(bridge, "[agent] directive cleared — back to autonomous questing")
             elif text:
                 directive["text"] = text
-                bridge.call("echo", text=f"[agent] directive accepted: {text}")
+                say(bridge, f"[agent] directive accepted: {text}")
                 log(f"player directive: {text}")
 
     for cycle in range(args.max_cycles):
@@ -367,7 +499,7 @@ def main():
             log("frontier empty — all reachable quests complete (or blocked)!")
             break
         log(f"cycle {cycle + 1}: {len(completed)} done, {len(frontier)} on frontier; planning via {llm.provider()}")
-        bridge.call("echo", text=f"[agent] quest progress: {len(completed)}/{len(quest_index)} — planning next moves...")
+        say(bridge, f"[agent] quest progress: {len(completed)}/{len(quest_index)} — planning next moves...")
         order = {c["filename"]: c["order_index"] for c in graph["chapters"]}
         frontier.sort(key=lambda q: (order.get(q["chapter"], 99), q["title"]))
         prompt = planner.build_planner_prompt(planner.chapter_summary(graph), frontier, game_state)
@@ -392,13 +524,14 @@ def main():
                 time.sleep(10)
         if plan is None:
             log("planning failed 3x — waiting 60s before next cycle")
-            bridge.call("echo", text="[agent] planner unavailable, will retry")
+            say(bridge, "[agent] planner unavailable, will retry")
             time.sleep(60)
             continue
         targets = ", ".join(t["title"] for t in plan.get("target_quests", [])[:5])
         log(f"plan: {len(plan.get('steps', []))} steps targeting: {targets}")
-        bridge.call("echo", text=f"[agent] working on: {targets[:120]}")
-        done, failed = run_plan(bridge, world, plan, actions, mark_complete)
+        say(bridge, f"[agent] working on: {targets[:120]}")
+        actions.chat_seen = directive["chat_seen"]
+        done, failed, _notes = run_plan(bridge, world, plan, actions, mark_complete)
         if failed:
             qid = failed.get("for_quest")
             fail_counts[qid] = fail_counts.get(qid, 0) + 1
@@ -407,15 +540,15 @@ def main():
             if qid and fail_counts[qid] >= 3:
                 blocked.add(qid)
                 log(f"quest {qid} failed {fail_counts[qid]} plans — blocking it this session")
-                bridge.call("echo", text=f"[agent] giving up on quest {qid} for now — "
-                                         f"may need your help with it later")
+                say(bridge, f"[agent] giving up on quest {qid} for now — "
+                            f"may need your help with it later")
             log(f"replanning after failure at step {failed.get('n')}")
     final_done = len(get_completed() & set(quest_index))
     gained = final_done - session_start_done
     summary = (f"[agent] session over — {final_done}/{len(quest_index)} quests total, "
                f"+{gained} this session")
     log(summary)
-    bridge.call("echo", text=summary)
+    say(bridge, summary)
 
 
 if __name__ == "__main__":
