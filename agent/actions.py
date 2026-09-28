@@ -429,6 +429,7 @@ class Actions(ActionExecutor):
     def interact(self, step):
         target = step.get("at")
         if isinstance(target, dict):
+            self._safe_hand()
             target = self._block_pos(target)
             self.bridge.call("look_at", x=target["x"] + 0.5, y=target["y"] + 0.5, z=target["z"] + 0.5)
             time.sleep(0.3)
@@ -698,6 +699,32 @@ class Actions(ActionExecutor):
         self.log(f"no standable air beside {at['x']},{at['y']},{at['z']}")
         return False
 
+    def _safe_hand(self):
+        """Select an empty hotbar slot before right-clicking a block.
+
+        Right-clicking with a usable item held (guide book, crafting
+        table...) fires the ITEM when the ray misses the block — observed
+        live: aiming up at an elevated chest grazed its pillar and opened
+        'Materials and You' instead of the chest. An empty hand misses
+        safe. Best effort: False when every hotbar slot is full.
+        """
+        slots = self.bridge.call("inventory_slots") or []
+        used = {s.get("slot") for s in slots if s.get("slot") in range(9)}
+        if next((s.get("slot") for s in slots if s.get("selected")),
+                None) not in used:
+            return True  # already holding nothing usable
+        free = [s for s in range(9) if s not in used]
+        if not free:
+            return False
+        self.bridge.call("select_slot", slot=free[0])
+        return True
+
+    def _aim_note(self):
+        """What the crosshair is on right now, for failure notes."""
+        tb = self.bridge.call("targeted_block") or {}
+        block = tb.get("block") if isinstance(tb, dict) else tb
+        return self._bare(block) if block else "nothing"
+
     def _open_container(self, at):
         """Aim at the container block and right-click it. None on success,
         else a short reason string.
@@ -706,16 +733,20 @@ class Actions(ActionExecutor):
         screen on sight — that would undo the click we just made.
         """
         self.bridge.call("close_screen")
+        self._safe_hand()
         at = self._block_pos(at)
         self.bridge.call("look_at", x=at["x"] + 0.5, y=at["y"] + 0.5, z=at["z"] + 0.5)
         time.sleep(0.3)
         self._tap("use")
         time.sleep(0.8)
         screen = (self.bridge.call("state") or {}).get("open_screen")
+        aim = self._aim_note()
         if not screen:
-            return "nothing opened (ray missed or the block is gone)"
+            return (f"nothing opened aiming at {aim} "
+                    f"(ray missed the container or the block is gone)")
         if self.bridge.call("container") is None:
-            return f"screen {screen!r} exposes no container slots"
+            return (f"screen {screen!r} exposes no container slots "
+                    f"(aiming at {aim})")
         return None
 
     def _stand_ready(self, at):

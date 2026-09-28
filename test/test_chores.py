@@ -38,6 +38,9 @@ class FakeBridge:
         self.chat = list(chat)
         self.inject = inject  # (after_polls, message) — player reply arrives late
         self.blocks = dict(blocks or {})
+        self.slots = []  # inventory_slots entries: {"slot","item","selected"}
+        self.screen = None  # state["open_screen"]
+        self.container = None  # container op result
         self._polls = 0
 
     def call(self, op, **kw):
@@ -54,7 +57,12 @@ class FakeBridge:
             return {"entries": [e for e in self.chat if e["n"] > since],
                     "latest": latest}
         if op == "state":
-            return {"inventory": {}, "position": {}}
+            return {"inventory": {}, "position": {},
+                    "open_screen": self.screen}
+        if op == "inventory_slots":
+            return list(self.slots)
+        if op == "container":
+            return self.container
         if op == "getblock":
             return self.blocks.get((kw["x"], kw["y"], kw["z"]), "minecraft:air")
         if op == "targeted_block":
@@ -283,6 +291,50 @@ def test_run_plan_does_not_retry_an_interrupted_step():
     assert done == 0 and failed is not None, (done, failed)
 
 
+def test_opening_blocks_starts_with_an_empty_hand():
+    """Right-clicking with a usable item held fires the ITEM when the ray
+    misses the block — observed live: aiming up at an elevated chest
+    grazed its pillar and opened 'Materials and You' instead."""
+    bridge = FakeBridge()
+    bridge.slots = [{"slot": 0, "item": "guide_book", "count": 1,
+                     "selected": True},
+                    {"slot": 9, "item": "sand", "count": 64,
+                     "selected": False}]
+    act = make_actions(bridge)
+    assert act._safe_hand() is True
+    selected = [kw["slot"] for op, kw in bridge.calls if op == "select_slot"]
+    assert selected and selected[0] not in (0,), (
+        f"must move off the book onto an empty hotbar slot, got {selected}")
+
+
+def test_empty_hand_already_is_left_alone():
+    bridge = FakeBridge()
+    bridge.slots = [{"slot": 9, "item": "sand", "count": 64,
+                     "selected": False}]
+    act = make_actions(bridge)
+    assert act._safe_hand() is True
+    assert not [1 for op, _ in bridge.calls if op == "select_slot"], (
+        f"no need to switch when nothing usable is held: {bridge.calls}")
+
+
+def test_open_failure_names_what_the_ray_hits():
+    bridge = FakeBridge()  # targeted_block -> stone, screen stays shut
+    act = make_actions(bridge)
+    reason = act._open_container({"x": 5, "y": 69, "z": 0})
+    assert reason is not None, "stone pillar must not open anything"
+    assert "stone" in reason, f"the note must name the blocker: {reason!r}"
+
+
+def test_wrong_screen_names_aim_and_screen():
+    bridge = FakeBridge()
+    bridge.screen = "Materials and You"  # the held-book misfire, live case
+    act = make_actions(bridge)
+    reason = act._open_container({"x": 5, "y": 69, "z": 0})
+    assert reason is not None, reason
+    assert "Materials and You" in reason and "stone" in reason, (
+        f"planner needs both halves of the diagnosis: {reason!r}")
+
+
 if __name__ == "__main__":
     test_only_the_players_own_lines_steer_the_bot()
     print("PASS test_only_the_players_own_lines_steer_the_bot")
@@ -316,4 +368,12 @@ if __name__ == "__main__":
     print("PASS test_goto_stops_moving_and_reports_the_interruption")
     test_run_plan_does_not_retry_an_interrupted_step()
     print("PASS test_run_plan_does_not_retry_an_interrupted_step")
+    test_opening_blocks_starts_with_an_empty_hand()
+    print("PASS test_opening_blocks_starts_with_an_empty_hand")
+    test_empty_hand_already_is_left_alone()
+    print("PASS test_empty_hand_already_is_left_alone")
+    test_open_failure_names_what_the_ray_hits()
+    print("PASS test_open_failure_names_what_the_ray_hits")
+    test_wrong_screen_names_aim_and_screen()
+    print("PASS test_wrong_screen_names_aim_and_screen")
     print("PASS")

@@ -101,6 +101,13 @@ class FakeBridge:
             return {"closed": True}
         if op == "look_at":
             return True
+        if op == "inventory_slots":
+            # hand selection is pinned in test_chores; here the hand is
+            # empty so take/put tests stay focused on mechanics
+            return []
+        if op == "targeted_block":
+            # these tests always aim at the chest under test
+            return {"block": "minecraft:chest", "position": [10, 66, 7]}
         if op == "press":
             if kw["control"] == "use" and kw["pressed"] and self.open_ok and self.screen is None:
                 self.screen = "Chest"
