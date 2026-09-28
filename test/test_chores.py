@@ -488,6 +488,29 @@ def test_manual_fails_on_silence_not_on_chatter():
     assert ok is False, (ok, note)
 
 
+def test_reply_answers_in_chat_and_completes():
+    """Status questions ("did you fill it?") are not jobs — the planner
+    must be able to just ANSWER instead of emitting a decoy action."""
+    bridge = FakeBridge()
+    act = make_actions(bridge)
+    ok, note = act.run({"action": {"action": "reply",
+                                   "text": "not yet — the table GUI needs typed input I cannot do"}})
+    assert ok is True, (ok, note)
+    said = chats(bridge)
+    assert any("not yet" in t for t in said), f"reply must speak: {said}"
+
+
+def test_chore_prompt_shows_worked_examples():
+    prompt = prompts_mod.build_chore_prompt("put sand in the chest", [], {})
+    assert "put_in_chest" in prompt and "reply" in prompt, prompt[:800]
+
+
+def test_chore_system_states_the_gui_boundary():
+    system = prompts_mod.get_chore_system("player")
+    assert "type" in system and ("phantom" in system or "button" in system), (
+        "the planner must know which GUI manipulations are impossible")
+
+
 if __name__ == "__main__":
     test_only_the_players_own_lines_steer_the_bot()
     print("PASS test_only_the_players_own_lines_steer_the_bot")
@@ -549,4 +572,10 @@ if __name__ == "__main__":
     print("PASS test_gui_interact_uses_the_aim_search")
     test_gui_interact_reports_search_failure()
     print("PASS test_gui_interact_reports_search_failure")
+    test_reply_answers_in_chat_and_completes()
+    print("PASS test_reply_answers_in_chat_and_completes")
+    test_chore_prompt_shows_worked_examples()
+    print("PASS test_chore_prompt_shows_worked_examples")
+    test_chore_system_states_the_gui_boundary()
+    print("PASS test_chore_system_states_the_gui_boundary")
     print("PASS")

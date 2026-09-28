@@ -936,6 +936,13 @@ class Actions(ActionExecutor):
         self.bridge.call("chat", text=step["text"])
         return True, "sent"
 
+    def reply(self, step):
+        """Answer the player in chat. For questions, status checks, and
+        anything that needs words, not blocks — emitting a decoy action
+        instead of answering is a planning failure."""
+        self.say(f"[agent] {step.get('text', '')}")
+        return True, "said"
+
     def manual(self, step):
         reason = step.get("reason", "unsupported action")
         self.say(f"[agent] NEED HELP: {reason} — do it, then reply in chat "
@@ -996,7 +1003,7 @@ class Actions(ActionExecutor):
         ok, note = handler(action)
         health_after = (self.bridge.call("state") or {}).get("health")
         if health_before and health_after and health_after < min(6, health_before - 8):
-            self.say("[agent] taking heavy damage — pausing, type .done when safe")
+            self.say("[agent] taking heavy damage — pausing, reply when safe")
             self.log(f"DANGER: health {health_before} -> {health_after}")
-            self._wait_for_player_signal(timeout=300)
+            self._wait_player_reply(timeout=300)
         return ok, note

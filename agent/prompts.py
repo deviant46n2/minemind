@@ -78,6 +78,7 @@ implements these and nothing else):
 - {"action": "quest_checkmark", "quest_id": "HEX"}                   # checkmark tasks: /ftbquests change progress (equivalent to clicking the book)
 - {"action": "manual", "reason": "why automation can't do this yet"} # escalate to human
 - {"action": "ask", "question": "what you need to know"}             # ask the PLAYER in chat; their reply completes the step — use this instead of guessing whenever a step depends on something unknowable (a location, which machine, a yes/no)
+- {"action": "reply", "text": "what you say"}                       # just ANSWER in chat (status questions, confirmations, "did you...?") — never emit a decoy action to avoid answering
 - {"action": "inspect", "at": {"x":..,"y":..,"z":..}}               # report the block id at coordinates ("at" optional — without it, reports what you are looking at). Use this to VERIFY a machine/container is really there before clicking it
 """
 
@@ -150,6 +151,17 @@ Rules for chore work (the player talks, you do — nothing else is your job):
   which of several machines, a yes/no, an item you can't see — emit an "ask"
   step INSTEAD of guessing. Guessing a location and marching off is a planning
   failure. One question per step; keep questions short and concrete.
+- Custom modded GUIs (transmutation table, lectern, machine controllers):
+  you can OPEN them (interact) and move real container slots, but you CANNOT
+  type text into search boxes, click phantom/preview slots, or press GUI
+  buttons — no primitive exists for that. When a step needs such a click,
+  use ask/manual immediately and say exactly what to click. Disguising it
+  with an unrelated action (using the wrong item on the block, inspecting
+  instead of acting) is the worst planning failure: it looks like progress
+  and achieves nothing.
+- When the player asks a question or checks status ("did you...?", "where
+  are you?", "what happened?"), answer with a "reply" step. Never emit a
+  decoy action to avoid answering.
 - "at" coordinates must come from the player, state.base, or a survey — never
   invent them. take_from_chest/put_in_chest need the container's block
   position; goto needs a real destination. Floor them to integers: a player
@@ -180,13 +192,14 @@ def get_chore_system(body="player"):
             + _WORLD_FACTS + "\n" + _CHORE_RULES)
 
 
-def build_chore_prompt(instruction, history, state):
+def build_chore_prompt(instruction, history, state, extra=None):
     """instruction: the player's latest words. history: [(speaker, text)]
-    oldest-first, "player" or "bot". state: live game state (no quests)."""
+    oldest-first, "player" or "bot". state: live game state (no quests).
+    extra: follow-up context (e.g. why the last plan failed) — appended."""
     import json as _json
     convo = "\n".join(f"{'Player' if s == 'player' else 'You'}: {t}"
                       for s, t in (history or []))
-    return f"""Current game state:
+    prompt = f"""Current game state:
 {_json.dumps(state, indent=1)}
 
 Recent conversation:
@@ -195,7 +208,23 @@ Recent conversation:
 Player's instruction:
 {instruction}
 
+Worked examples of good plans:
+- Player: "put the sand in the input chest" (state.base lists the input
+  chest at 5,69,0) -> {{"steps": [{{"n": 1, "action": {{"action":
+  "put_in_chest", "item": "minecraft:sand", "count": 64,
+  "at": {{"x": 5, "y": 69, "z": 0}}}}, "notes": "deposit"}}]}}
+- Player: "get dust from the output chest" (location known) ->
+  take_from_chest with that chest's "at". Location unknown -> ask first,
+  never goto_block the nearest terrain match.
+- Player: "did you fill it?" -> {{"steps": [{{"n": 1, "action": {{"action":
+  "reply", "text": "not yet — ..."}}, "notes": "answer"}}]}}
+- Player: "take sand from the table" (custom GUI, needs typed search) ->
+  ask the player to pull it out (or manual with exact click instructions).
+
 Do what they asked, in order, with the action vocabulary. JSON only."""
+    if extra:
+        prompt += f"\n\nFollow-up context (failed last attempt, adjust):\n{extra}"
+    return prompt
 
 
 def build_planner_prompt(chapter_summary, frontier_quests, state, max_quests=10):
