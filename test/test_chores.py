@@ -411,6 +411,26 @@ def test_select_distinguishes_missing_from_unselectable():
     assert act._select_item("sand") == "select_failed"
 
 
+def test_manual_completes_on_any_player_reply():
+    """manual is a conversation, not a .done gate: any reply continues the
+    turn (the reply text travels, so the next plan knows what was said).
+    A misfired escalation must never freeze the bot for 15 minutes."""
+    bridge = FakeBridge(inject=(2, f"<{PLAYER}> give me a minute"))
+    act = make_actions(bridge)
+    ok, note = act.manual({"reason": "drive the boat", "timeout": 30})
+    assert ok is True, (ok, note)
+    assert "give me a minute" in note, note
+    said = chats(bridge)
+    assert any("NEED HELP" in t for t in said), said
+
+
+def test_manual_fails_on_silence_not_on_chatter():
+    bridge = FakeBridge()
+    act = make_actions(bridge)
+    ok, note = act.manual({"reason": "drive the boat", "timeout": 0})
+    assert ok is False, (ok, note)
+
+
 if __name__ == "__main__":
     test_only_the_players_own_lines_steer_the_bot()
     print("PASS test_only_the_players_own_lines_steer_the_bot")
@@ -460,4 +480,8 @@ if __name__ == "__main__":
     print("PASS test_select_item_closes_a_stuck_screen_first")
     test_select_distinguishes_missing_from_unselectable()
     print("PASS test_select_distinguishes_missing_from_unselectable")
+    test_manual_completes_on_any_player_reply()
+    print("PASS test_manual_completes_on_any_player_reply")
+    test_manual_fails_on_silence_not_on_chatter()
+    print("PASS test_manual_fails_on_silence_not_on_chatter")
     print("PASS")

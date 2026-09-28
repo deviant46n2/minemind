@@ -914,11 +914,13 @@ class Actions(ActionExecutor):
 
     def manual(self, step):
         reason = step.get("reason", "unsupported action")
-        self.say(f"[agent] NEED HELP: {reason} — do it, then type .done in chat")
+        self.say(f"[agent] NEED HELP: {reason} — do it, then reply in chat "
+                 f"and I'll continue")
         self.log(f"MANUAL ESCALATION: {reason}")
-        if not self._wait_for_player_signal():
+        reply = self._wait_player_reply(timeout=step.get("timeout", 900))
+        if reply is None:
             return False, "player never confirmed manual step"
-        return True, "human handled it"
+        return True, f"player replied: {reply}"
 
     # models drift across body modes despite prompt rules — route structurally.
     # companion mode: resource work goes to the PlayerEngine entity;
