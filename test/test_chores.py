@@ -385,6 +385,8 @@ def test_open_reports_every_aim_when_nothing_opens():
     assert reason is not None and "5,69,0" in reason, reason
     looks = [kw for op, kw in bridge.calls if op == "look_at"]
     assert len(looks) >= 3, f"must work the aim points, got {looks}"
+    assert any(kw["x"] == 5.0 for kw in looks), (
+        f"side faces must be tried (bottom is occluded live): {looks}")
 
 
 def test_select_item_closes_a_stuck_screen_first():
@@ -409,6 +411,32 @@ def test_select_distinguishes_missing_from_unselectable():
                      "selected": False}]
     bridge.hand_item = "materials_and_you"  # selection never lands
     assert act._select_item("sand") == "select_failed"
+
+
+def test_safe_hand_stashes_the_book_when_hotbar_full():
+    """Live case: all 9 hotbar slots full, book selected — empty-hand is
+    impossible by selecting, so stash the held stack into a free main
+    slot via SWAP (slot_to_hotbar swaps the main slot with the selected
+    hotbar slot — verified in Minescript.java)."""
+    bridge = FakeBridge()
+    bridge.slots = [{"slot": s, "item": f"item_{s}", "count": 1,
+                     "selected": s == 0} for s in range(9)]
+    bridge.hand_item = None  # stash leaves the hand empty
+    act = make_actions(bridge)
+    assert act._safe_hand() is True
+    ops = [(op, kw.get("slot")) for op, kw in bridge.calls
+           if op in ("select_slot", "slot_to_hotbar")]
+    assert (("select_slot", 0) in ops and ("slot_to_hotbar", 9) in ops), ops
+
+
+def test_safe_hand_gives_up_when_everywhere_full():
+    bridge = FakeBridge()
+    bridge.slots = [{"slot": s, "item": f"item_{s}", "count": 1,
+                     "selected": s == 0} for s in range(36)]
+    act = make_actions(bridge)
+    assert act._safe_hand() is False
+    assert not [1 for op, _ in bridge.calls
+                if op in ("select_slot", "slot_to_hotbar")], bridge.calls
 
 
 def test_manual_completes_on_any_player_reply():
@@ -480,6 +508,10 @@ if __name__ == "__main__":
     print("PASS test_select_item_closes_a_stuck_screen_first")
     test_select_distinguishes_missing_from_unselectable()
     print("PASS test_select_distinguishes_missing_from_unselectable")
+    test_safe_hand_stashes_the_book_when_hotbar_full()
+    print("PASS test_safe_hand_stashes_the_book_when_hotbar_full")
+    test_safe_hand_gives_up_when_everywhere_full()
+    print("PASS test_safe_hand_gives_up_when_everywhere_full")
     test_manual_completes_on_any_player_reply()
     print("PASS test_manual_completes_on_any_player_reply")
     test_manual_fails_on_silence_not_on_chatter()

@@ -715,24 +715,37 @@ class Actions(ActionExecutor):
         return False
 
     def _safe_hand(self):
-        """Select an empty hotbar slot before right-clicking a block.
+        """Empty the hand before right-clicking a block.
 
         Right-clicking with a usable item held (guide book, crafting
         table...) fires the ITEM when the ray misses the block — observed
         live: aiming up at an elevated chest grazed its pillar and opened
-        'Materials and You' instead of the chest. An empty hand misses
-        safe. Best effort: False when every hotbar slot is full.
+        'Materials and You' instead of the chest. Best effort: False when
+        there is nowhere to put the held stack.
         """
+        self.bridge.call("close_screen")  # GUI intercepts hotbar keys
         slots = self.bridge.call("inventory_slots") or []
         used = {s.get("slot") for s in slots if s.get("slot") in range(9)}
-        if next((s.get("slot") for s in slots if s.get("selected")),
-                None) not in used:
-            return True  # already holding nothing usable
+        held = next((s.get("slot") for s in slots if s.get("selected")), None)
+        if held not in used:
+            return True  # already holding nothing (or selection unknown)
         free = [s for s in range(9) if s not in used]
-        if not free:
+        if free:
+            self.bridge.call("select_slot", slot=free[0])
+            return True
+        # hotbar full (observed live: book + tools + stacks): stash the
+        # held stack into a free main-inventory slot — slot_to_hotbar
+        # SWAPs that main slot with the selected hotbar slot.
+        main_used = {s.get("slot") for s in slots
+                     if 9 <= (s.get("slot") if s.get("slot") is not None else -1) <= 35}
+        main_free = [s for s in range(9, 36) if s not in main_used]
+        if not main_free:
             return False
-        self.bridge.call("select_slot", slot=free[0])
-        return True
+        self.bridge.call("select_slot", slot=held)
+        self.bridge.call("slot_to_hotbar", slot=main_free[0])
+        time.sleep(0.3)
+        hand = self.bridge.call("hand") or {}
+        return not hand.get("item")
 
     def _aim_note(self):
         """What the crosshair is on right now, for failure notes."""
@@ -759,7 +772,10 @@ class Actions(ActionExecutor):
         at = self._block_pos(at)
         aims = [(0.5, 0.5, 0.5), (0.5, 0.05, 0.5),
                 (0.1, 0.05, 0.1), (0.9, 0.05, 0.1),
-                (0.1, 0.05, 0.9), (0.9, 0.05, 0.9)]
+                (0.1, 0.05, 0.9), (0.9, 0.05, 0.9),
+                (0.0, 0.5, 0.5), (1.0, 0.5, 0.5),
+                (0.5, 0.5, 0.0), (0.5, 0.5, 1.0),
+                (0.5, 1.0, 0.5)]
         tried = []
         for dx, dy, dz in aims:
             self.bridge.call("close_screen")
