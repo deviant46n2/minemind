@@ -10,6 +10,8 @@ Every executor returns (ok: bool, note: str). Verification is state-based
 import json
 import time
 
+from executor import ActionExecutor
+
 # verified against FTB docs + live run: change_progress is ONE word (underscore)
 CHECKMARK_CMD = "/ftbquests change_progress @s complete {quest_id}"
 CMD_ERRORS = ("permission", "unknown command", "no such", "incorrect argument",
@@ -43,7 +45,7 @@ def extract_player_lines(entries, player_name, bot_name="CoopBot"):
     return out
 
 
-class Actions:
+class Actions(ActionExecutor):
     def __init__(self, bridge, get_completed_quests, log, mp=False, mark_complete=None,
                  body="companion", player_name=None):
         self.bridge = bridge          # BridgeClient (daemon.py)
@@ -67,6 +69,15 @@ class Actions:
         directly for those.
         """
         self.bridge.call("chat", text=text)
+
+    def interrupt(self):
+        """Halt the body now. Player body: Baritone #stop. Companion body:
+        /agent stop (PlayerEngine executor halt)."""
+        if self.body == "companion":
+            self.bridge.call("chat", text="/agent stop")
+        else:
+            self.bridge.call("chat", text="#stop")
+        return True
 
     def _qname(self, qid):
         title = self.quest_titles.get(qid)
@@ -279,7 +290,7 @@ class Actions:
         self.bridge.call("chat", text=f"#goto {int(x)} {int(y)} {int(z)}")
         ok = self._baritone_idle(timeout=step.get("timeout", 300))
         if self.interrupted:
-            self.bridge.call("chat", text="#stop")
+            self.interrupt()
             return False, f"interrupted: {self.interrupted[0][1][:120]}"
         pos = self._position()
         if pos and abs(pos["x"] - x) <= 4 and abs(pos["z"] - z) <= 4:
@@ -291,7 +302,7 @@ class Actions:
         self.bridge.call("chat", text=f"#goto {block}")
         ok = self._baritone_idle(timeout=step.get("timeout", 420))
         if self.interrupted:
-            self.bridge.call("chat", text="#stop")
+            self.interrupt()
             return False, f"interrupted: {self.interrupted[0][1][:120]}"
         return ok, f"pathed toward nearest {block}"
 
