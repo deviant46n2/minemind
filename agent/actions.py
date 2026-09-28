@@ -443,6 +443,14 @@ class Actions(ActionExecutor):
     def interact(self, step):
         target = step.get("at")
         if isinstance(target, dict):
+            if step.get("gui"):
+                # opening is opening: every GUI goes through the same
+                # aim-search as take/put, never a single center look
+                blocked = self._open_container(target)
+                if blocked is not None:
+                    return False, blocked
+                after = (self.bridge.call("state") or {}).get("open_screen")
+                return True, f"screen: {after!r}"
             self.bridge.call("close_screen")
             self._safe_hand()
             target = self._block_pos(target)

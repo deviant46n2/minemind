@@ -439,6 +439,35 @@ def test_safe_hand_gives_up_when_everywhere_full():
                 if op in ("select_slot", "slot_to_hotbar")], bridge.calls
 
 
+def test_gui_interact_uses_the_aim_search():
+    """interact(gui:true) must open through the same aim-search as
+    take/put — a single center look bypasses every fix and fails the
+    same way forever."""
+    bridge = FakeBridge()
+    bridge.open_ok = True
+    bridge.aim_gated = True
+    bridge.good_aim = (5.9, 69.05, 0.9)
+    bridge.container = []
+    act = make_actions(bridge)
+    ok, note = act.interact({"block": "minecraft:chest", "gui": True,
+                             "at": {"x": 5, "y": 69, "z": 0}})
+    assert ok is True, (ok, note)
+    assert "Chest" in note, note
+    looks = [kw for op, kw in bridge.calls if op == "look_at"]
+    assert len(looks) >= 2, f"must search past the blocked center: {looks}"
+
+
+def test_gui_interact_reports_search_failure():
+    bridge = FakeBridge()
+    bridge.open_ok = True
+    bridge.aim_gated = True
+    bridge.good_aim = (999, 999, 999)
+    act = make_actions(bridge)
+    ok, note = act.interact({"block": "minecraft:chest", "gui": True,
+                             "at": {"x": 5, "y": 69, "z": 0}})
+    assert ok is False and "5,69,0" in note, (ok, note)
+
+
 def test_manual_completes_on_any_player_reply():
     """manual is a conversation, not a .done gate: any reply continues the
     turn (the reply text travels, so the next plan knows what was said).
@@ -516,4 +545,8 @@ if __name__ == "__main__":
     print("PASS test_manual_completes_on_any_player_reply")
     test_manual_fails_on_silence_not_on_chatter()
     print("PASS test_manual_fails_on_silence_not_on_chatter")
+    test_gui_interact_uses_the_aim_search()
+    print("PASS test_gui_interact_uses_the_aim_search")
+    test_gui_interact_reports_search_failure()
+    print("PASS test_gui_interact_reports_search_failure")
     print("PASS")
